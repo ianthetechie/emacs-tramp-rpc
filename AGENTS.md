@@ -2,6 +2,9 @@
 
 for details about the project see @README.org
 
+# Backwards compatibility
+Elisp code needs to match the respective rust server. There is no backwards compatibility.
+
 # Building the Rust server
 The script to build the rust server is located at: scripts/build-all.sh
 
@@ -32,6 +35,16 @@ Always use `emacs -Q --batch --eval <lisp commands>`
 When testing updates to the rust server, always copy it to a temporary location and set `tramp-rpc-deploy-remote-directory` to the temporary path so that testing does not interfere with existing sessions. Use `scripts/build_all.sh` to rebuild the server binary. Then SCP it to a new location and set the variable.
 
 Always test changes to the code.
+
+## Test quality
+
+- Test observable behavior and regressions, not source text, generated-file
+  spelling, or the existence of definitions exercised by other tests.
+- For shell builders, execute the command against temporary local files and
+  assert outputs, exit status, and filesystem effects instead of command text.
+- Keep mocks at external boundaries.  Do not duplicate the implementation in
+  the expected result or add prerequisite skips for dependencies already required
+  by the suite.  Keep skips for genuinely optional platform capabilities.
 
 ## Test Example
 

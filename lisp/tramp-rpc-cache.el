@@ -37,12 +37,12 @@
 (require 'tramp-rpc-connection)
 (require 'tramp-rpc-transport)
 
-;; Functions from tramp-rpc.el
-(declare-function tramp-rpc--canonical-watch-active-p "tramp-rpc")
-(declare-function tramp-rpc--file-notify-alias-paths "tramp-rpc")
-(declare-function tramp-rpc--file-notify-dispatch "tramp-rpc")
-(declare-function tramp-rpc--file-notify-dispatch-rescan "tramp-rpc")
-(declare-function tramp-rpc--watch-entry-canonical-directory "tramp-rpc")
+;; Functions from tramp-rpc-notify.el
+(declare-function tramp-rpc--canonical-watch-active-p "tramp-rpc-notify")
+(declare-function tramp-rpc--file-notify-alias-paths "tramp-rpc-notify")
+(declare-function tramp-rpc--file-notify-dispatch "tramp-rpc-notify")
+(declare-function tramp-rpc--file-notify-dispatch-rescan "tramp-rpc-notify")
+(declare-function tramp-rpc--watch-entry-canonical-directory "tramp-rpc-notify")
 
 ;; ============================================================================
 ;; Hooks into higher layers
@@ -55,10 +55,11 @@ state from file metadata can drop their entries for that connection.  VEC
 is nil when every cache is cleared, regardless of connection.")
 
 (defvar tramp-rpc-fs-events-functions nil
-  "Functions called with VEC when the server reports filesystem events on VEC.
-Run before the event paths are invalidated.  Not run while
-`tramp-rpc--suppress-fs-notifications' is non-nil unless the batch contains
-a rescan, since a rescan means concrete events were lost.")
+  "Functions called with VEC and PATHS for filesystem events on VEC.
+PATHS lists the changed TRAMP file names, or is nil when the changes are
+unknown because the server lost events.  Run before the event paths are
+invalidated.  Events in `tramp-rpc--expected-fs-events' are left out, and
+the hook is not run when only such events remain.")
 
 
 ;; ============================================================================
@@ -148,6 +149,14 @@ Unlike `tramp-rpc--cache-get', this preserves cached nil values."
             value
           (remhash key cache)
           'not-cached)))))
+
+(defun tramp-rpc--file-property-key (vec localname property)
+  "Return a route-aware TRAMP cache property for VEC, LOCALNAME and PROPERTY.
+TRAMP unifies file keys by stripping hops and trailing slashes.  Include
+those distinctions in the property instead, retaining TRAMP's normal
+expiry, subtree invalidation and connection cleanup."
+  (tramp-rpc--route-property-name
+   vec (format "rpc-file:%s:%s" property (string-suffix-p "/" localname))))
 
 (defun tramp-rpc--file-stat-cache-key (vec localname lstat)
   "Return file.stat cache key for VEC, LOCALNAME, and LSTAT."
@@ -363,9 +372,23 @@ Keys are \"conn-key:path\" strings, values are plists with watch metadata.")
 
 (defvar tramp-rpc--file-notify-watch-counts)
 
-(defvar tramp-rpc--suppress-fs-notifications nil
-  "When non-nil, suppress cache handling of fs.events notifications.
-Used during operations that will invalidate caches themselves.")
+(defvar tramp-rpc--expected-fs-events nil
+  "Filesystem events caused by operations in progress.
+Each element is (CONNECTION-KEY . REGEXP).  An event on that connection whose
+paths all match REGEXP is still reported to `file-notify', but neither
+invalidates caches nor runs `tramp-rpc-fs-events-functions': the operation
+causing it keeps that state current itself.  Events for other paths or
+connections that arrive while this is bound keep their full effect.")
+
+(defun tramp-rpc--expected-fs-event-p (connection-key paths)
+  "Return non-nil when all PATHS on CONNECTION-KEY are expected events."
+  (and paths
+       (cl-some (lambda (expected)
+                  (and (equal (car expected) connection-key)
+                       (cl-every (lambda (path)
+                                   (string-match-p (cdr expected) path))
+                                 paths)))
+                tramp-rpc--expected-fs-events)))
 
 (defun tramp-rpc--connection-key-string (vec)
   "Return a string key for connection VEC, suitable for hash table keys."
@@ -448,16 +471,25 @@ DIRECTORY itself returns the empty string.  Descendants can contain slashes."
       (when-let* ((vec (process-get process :tramp-rpc-vec))
                   (connection (tramp-rpc--get-connection vec))
                   ((eq process (tramp-rpc-connection-process connection))))
-        (when (or (not tramp-rpc--suppress-fs-notifications)
-                  (cl-some (lambda (event)
-                             (equal (alist-get 'action event) "rescan"))
-                           events))
-          ;; The remote changed on this transport, not every remote
-          ;; connection.  A rescan means concrete events were lost, so it
-          ;; must be reported even while ordinary notification handling is
-          ;; suppressed.
-          (run-hook-with-args 'tramp-rpc-fs-events-functions vec))
-        (let (renamed-pairs)
+        (let ((connection-key (tramp-rpc--connection-key-string vec))
+              renamed-pairs)
+          (cl-flet* ((event-paths (event)
+                       (delq nil
+                             (list (tramp-rpc--fs-event-path vec event 'path)
+                                   (tramp-rpc--fs-event-path
+                                    vec event 'path1))))
+                     (expected-p (event)
+                       (tramp-rpc--expected-fs-event-p
+                        connection-key (event-paths event))))
+            ;; The remote changed on this transport, not every remote
+            ;; connection.  A rescan has no paths, so it is never expected,
+            ;; and it reports unknown paths.
+            (when-let* ((unexpected (cl-remove-if #'expected-p events)))
+              (run-hook-with-args
+               'tramp-rpc-fs-events-functions vec
+               (unless (cl-some (lambda (event) (null (event-paths event)))
+                                unexpected)
+                 (mapcan #'event-paths unexpected))))
           ;; Linux/inotify can report the same rename as both a combined pair
           ;; and as cookie-tracked from/to events in one debounce batch.  Emacs'
           ;; filenotify tests expect one public `renamed' action, so suppress
@@ -486,22 +518,20 @@ DIRECTORY itself returns the empty string.  Descendants can contain slashes."
                 (if (string= action "rescan")
                     (progn
                       ;; A rescan means concrete paths were dropped, including
-                      ;; potentially unrelated changes that the suppressed
-                      ;; operation will not invalidate itself.
+                      ;; unexpected changes no operation invalidates itself.
                       (tramp-rpc--clear-file-caches-for-connection vec)
                       ;; Public file-notify consumers still need a conservative
                       ;; event for the dropped paths.
                       (tramp-rpc--file-notify-dispatch-rescan process))
                   (when path
-                    ;; File notifications are deliberately not suppressed by
-                    ;; `tramp-rpc--suppress-fs-notifications': that variable only
-                    ;; suppresses cache/status work during operations that
-                    ;; invalidate caches themselves.
-                    (unless tramp-rpc--suppress-fs-notifications
+                    ;; Expected events skip only cache work; file-notify
+                    ;; consumers still see every event.
+                    (unless (expected-p event)
                       (tramp-rpc--invalidate-event-path path)
                       (when path1
                         (tramp-rpc--invalidate-event-path path1)))
-                    (tramp-rpc--file-notify-dispatch action path path1 cookie)))))))))))
+                    (tramp-rpc--file-notify-dispatch
+                     action path path1 cookie))))))))))))
 
 (defun tramp-rpc-watch-directory (directory &optional recursive)
   "Start watching DIRECTORY for filesystem change events.
@@ -517,7 +547,8 @@ When RECURSIVE is non-nil, watch subdirectories too."
       (if (and recursive
                (not (tramp-rpc--watch-entry-recursive-p entry))
                file-notify-entry
-               (plist-get file-notify-entry :owned))
+               (plist-get file-notify-entry :owned)
+               (not (plist-get file-notify-entry :nofollow)))
           ;; Upgrade a file-notify-owned direct watch by relying on the server's
           ;; atomic non-recursive-to-recursive upgrade path.  Do not remove the
           ;; existing watch first; if the recursive add fails, the server rolls
@@ -567,7 +598,9 @@ When RECURSIVE is non-nil, watch subdirectories too."
       ;; non-recursive explicit watches; otherwise a still-valid file-notify
       ;; descriptor could be left without any server watch underneath it.
       (when (and file-notify-entry
-                 (not (plist-get file-notify-entry :owned)))
+                 (not (plist-get file-notify-entry :owned))
+                 (not (plist-get file-notify-entry :synthetic))
+                 (not (plist-get file-notify-entry :nofollow)))
         (let ((result (tramp-rpc--call v "watch.add"
                                        `((path . ,localname)
                                          (recursive . :msgpack-false)))))
@@ -581,7 +614,8 @@ When RECURSIVE is non-nil, watch subdirectories too."
          v "watch.remove"
          `((path . ,(if (stringp canonical-directory)
                         (tramp-file-local-name canonical-directory)
-                      localname))))))
+                      localname))
+           (nofollow . :msgpack-false)))))
     (tramp-rpc--debug "Unwatched: %s" localname)))
 
 (defun tramp-rpc--cleanup-watches-for-connection (vec &optional connection-process)

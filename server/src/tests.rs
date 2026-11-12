@@ -4,6 +4,7 @@
 
 use super::*;
 use rmpv::Value;
+use tokio::io::AsyncWriteExt;
 
 fn make_request(method: &str, params: Value) -> Vec<u8> {
     make_request_with_id(1, method, params)
@@ -152,29 +153,29 @@ async fn test_blocked_batch_uses_idle_permits_without_unbounded_bypass() {
         DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(2),
-            method: "process.status".into(),
+            method: "system.info".into(),
             params: Value::Nil,
         }),
         DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(3),
-            method: "process.status".into(),
+            method: "system.info".into(),
             params: Value::Nil,
         }),
         DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(4),
-            method: "process.status".into(),
+            method: "system.info".into(),
             params: Value::Nil,
         }),
         DeferredRequest::for_test(Request {
             version: "2.0".into(),
             id: RequestId::Number(5),
-            method: "process.status".into(),
+            method: "system.info".into(),
             params: Value::Nil,
         }),
     ]);
-    let writer = Arc::new(Mutex::new(tokio::io::sink()));
+    let writer = Arc::new(FrameWriter::new(tokio::io::sink()));
     let mut tasks = JoinSet::new();
     let mut bypass_budget = None;
 
@@ -209,7 +210,7 @@ async fn test_new_general_requests_share_bounded_batch_bypass_budget() {
         method: "batch".into(),
         params: Value::Nil,
     })]);
-    let writer = Arc::new(Mutex::new(tokio::io::sink()));
+    let writer = Arc::new(FrameWriter::new(tokio::io::sink()));
     let mut tasks = JoinSet::new();
     let mut bypass_budget = None;
     let (errors, _error_responses) = mpsc::channel(1);
@@ -225,7 +226,7 @@ async fn test_new_general_requests_share_bounded_batch_bypass_budget() {
 
     for id in 2..=5 {
         accept_frame(
-            make_request_with_id(id, "process.status", Value::Nil),
+            make_request_with_id(id, "system.info", Value::Nil),
             &mut deferred,
             &admissions,
             &mut tasks,
@@ -251,16 +252,42 @@ async fn test_new_general_requests_share_bounded_batch_bypass_budget() {
 }
 
 #[test]
-fn test_blocked_pty_writes_use_dedicated_admission() {
+fn test_blocked_process_writes_use_dedicated_admission() {
+    for method in ["process.write", "process.write_pty"] {
+        let admissions = Admissions::default();
+        let _writes = admissions
+            .try_acquire_many(task_class(method), PROCESS_WRITE_TASK_LIMIT)
+            .expect("reserve every write permit");
+
+        assert_eq!(task_class(method), TaskClass::ProcessWrite);
+        assert!(admissions.try_acquire(TaskClass::General).is_some());
+        assert!(
+            admissions
+                .try_acquire(task_class("process.signal"))
+                .is_some()
+        );
+        assert!(admissions.try_acquire(task_class("system.ping")).is_some());
+    }
+}
+
+#[tokio::test]
+async fn test_connection_probe_responds_with_general_slots_occupied() {
     let admissions = Admissions::default();
     let _general = admissions
         .try_acquire_many(TaskClass::General, GENERAL_TASK_LIMIT)
         .expect("reserve every general permit");
-
-    assert_eq!(task_class("process.write_pty"), TaskClass::PtyWrite);
-    assert_eq!(task_class("process.signal"), TaskClass::Control);
-    assert!(admissions.try_acquire(TaskClass::PtyWrite).is_some());
-    assert!(admissions.try_acquire(TaskClass::Control).is_some());
+    assert_eq!(task_class("system.ping"), TaskClass::Control);
+    let _probe = admissions.try_acquire(task_class("system.ping")).unwrap();
+    let request = protocol::Request {
+        version: "2.0".into(),
+        id: RequestId::Number(1),
+        method: "system.ping".into(),
+        params: Value::Nil,
+    };
+    assert_eq!(
+        handlers::dispatch(request).await.result,
+        Some(Value::Boolean(true))
+    );
 }
 
 /// Malformed frames must always be answered.  A dropped response leaves
@@ -275,7 +302,7 @@ async fn test_every_malformed_frame_is_answered() {
     let (server_writer, mut client_reader) = tokio::io::duplex(4096);
     let connection = tokio::spawn(run_connection(
         server_reader,
-        Arc::new(Mutex::new(server_writer)),
+        Arc::new(FrameWriter::new(server_writer)),
         None,
     ));
 
@@ -337,7 +364,7 @@ async fn test_connection_handles_fragmented_frame_while_writing_response() {
     let _test_lock = handlers::process::test_process_map_lock().await;
     let (mut client, server_reader) = tokio::io::duplex(1024);
     let (server_writer, mut client_reader) = tokio::io::duplex(1024);
-    let writer = Arc::new(Mutex::new(server_writer));
+    let writer = Arc::new(FrameWriter::new(server_writer));
     let connection = tokio::spawn(run_connection(server_reader, writer, None));
     let first = make_request("missing.first", Value::Map(vec![]));
     let second = make_request("missing.second", Value::Map(vec![]));
@@ -375,7 +402,7 @@ async fn test_connection_recovers_admission_after_panicked_tasks() {
     let (server_writer, mut client_reader) = tokio::io::duplex(4096);
     let connection = tokio::spawn(run_connection(
         server_reader,
-        Arc::new(Mutex::new(server_writer)),
+        Arc::new(FrameWriter::new(server_writer)),
         None,
     ));
 
@@ -737,7 +764,7 @@ async fn test_connection_eof_kills_synchronous_process_groups() {
         let (server_writer, _client_reader) = tokio::io::duplex(4096);
         let connection = tokio::spawn(run_connection(
             server_reader,
-            Arc::new(Mutex::new(server_writer)),
+            Arc::new(FrameWriter::new(server_writer)),
             None,
         ));
         client
@@ -795,6 +822,79 @@ fn map_get_id(value: &Value) -> Option<i64> {
 /// still be SIGKILLed and reaped when the transport reaches EOF, so the
 /// connection task terminates within its bounded cleanup window.
 #[tokio::test]
+async fn test_output_failure_reaps_children_without_input_eof() {
+    let _test_lock = handlers::process::test_process_map_lock().await;
+    handlers::process::start(msgpack_map! {
+        "cmd" => "sleep", "args" => Value::Array(vec![Value::from("30")])
+    })
+    .await
+    .unwrap();
+    let managed_pids = handlers::process::test_managed_os_pids().await;
+    assert_eq!(managed_pids.len(), 1);
+    let (client, reader) = tokio::io::duplex(4096);
+    let (output, output_peer) = tokio::io::duplex(4096);
+    let writer = Arc::new(FrameWriter::new(output));
+    let connection = tokio::spawn(run_connection(reader, Arc::clone(&writer), None));
+    drop(output_peer);
+    assert!(writer.write_frame(b"notification").await.is_err());
+    // Keep input open: notification failure alone must initiate teardown.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), connection)
+        .await
+        .expect("output failure cleanup should be bounded")
+        .expect("connection should not panic");
+    assert!(result.is_err());
+    assert!(handlers::process::test_managed_maps_empty().await);
+    assert!(matches!(
+        nix::sys::wait::waitpid(
+            nix::unistd::Pid::from_raw(managed_pids[0]),
+            Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+        ),
+        Err(nix::errno::Errno::ECHILD)
+    ));
+    drop(client);
+}
+
+#[tokio::test]
+async fn test_connection_eof_unblocks_output_and_reaps_children() {
+    let _test_lock = handlers::process::test_process_map_lock().await;
+    handlers::process::start(msgpack_map! {
+        "cmd" => "sleep", "args" => Value::Array(vec![Value::from("30")])
+    })
+    .await
+    .unwrap();
+    let child_pid = handlers::process::test_managed_os_pids().await[0];
+    let (client, reader) = tokio::io::duplex(4096);
+    let (output, mut output_peer) = tokio::io::duplex(4);
+    let writer = Arc::new(FrameWriter::new(output));
+    let connection = tokio::spawn(run_connection(reader, Arc::clone(&writer), None));
+    let notification = tokio::spawn(async move { writer.write_frame(b"undrained output").await });
+    let mut header = [0; 4];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        output_peer.read_exact(&mut header),
+    )
+    .await
+    .expect("notification should start writing")
+    .unwrap();
+    // Keep the output peer open without draining its payload.
+    drop(client);
+    tokio::time::timeout(std::time::Duration::from_secs(3), connection)
+        .await
+        .expect("input EOF must not depend on draining output")
+        .expect("connection task should not panic")
+        .expect("input EOF cleanup should succeed");
+    assert!(notification.await.unwrap().is_err());
+    assert!(handlers::process::test_managed_maps_empty().await);
+    assert!(matches!(
+        nix::sys::wait::waitpid(
+            nix::unistd::Pid::from_raw(child_pid),
+            Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+        ),
+        Err(nix::errno::Errno::ECHILD)
+    ));
+}
+
+#[tokio::test]
 async fn test_connection_eof_second_cleanup_catches_late_registration() {
     let _test_lock = handlers::process::test_process_map_lock().await;
     let barrier = Arc::new(CleanupBarrier {
@@ -805,7 +905,7 @@ async fn test_connection_eof_second_cleanup_catches_late_registration() {
     let (server_writer, _client_reader) = tokio::io::duplex(4096);
     let connection = tokio::spawn(run_connection(
         server_reader,
-        Arc::new(Mutex::new(server_writer)),
+        Arc::new(FrameWriter::new(server_writer)),
         Some(Arc::clone(&barrier)),
     ));
 
@@ -852,7 +952,7 @@ async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
     let (server_writer, mut client_reader) = tokio::io::duplex(4096);
     let connection = tokio::spawn(run_connection(
         server_reader,
-        Arc::new(Mutex::new(server_writer)),
+        Arc::new(FrameWriter::new(server_writer)),
         None,
     ));
     let temp = tempfile::tempdir().expect("temporary marker directory");
@@ -886,21 +986,20 @@ async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
             .await
             .unwrap();
     }
-    let mut pipe_pid = None;
-    let mut pty_pid = None;
+    let mut started = Vec::new();
     for _ in 0..2 {
         let response = read_frame(&mut client_reader).await;
         assert!(map_get(&response, "error").is_none(), "{response:?}");
-        let pid = map_get(&response, "result")
-            .and_then(|result| map_get(result, "pid"))
-            .and_then(Value::as_u64)
-            .expect("start response pid") as i64;
-        match map_get_id(&response) {
-            Some(101) => pipe_pid = Some(pid),
-            Some(102) => pty_pid = Some(pid),
-            id => panic!("unexpected start response id: {id:?}"),
-        }
+        assert!(
+            map_get(&response, "result")
+                .and_then(|result| map_get(result, "pid"))
+                .is_some(),
+            "start response pid"
+        );
+        started.push(map_get_id(&response));
     }
+    started.sort();
+    assert_eq!(started, [Some(101), Some(102)]);
 
     for marker in &markers {
         wait_for_marker(marker).await;
@@ -908,41 +1007,9 @@ async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
 
     let managed_pids = handlers::process::test_managed_os_pids().await;
     assert_eq!(managed_pids.len(), 2);
-    client
-        .write_all(&frame(&make_request(
-            "process.read",
-            Value::Map(vec![
-                (
-                    Value::String("pid".into()),
-                    Value::Integer(pipe_pid.expect("pipe pid").into()),
-                ),
-                (
-                    Value::String("timeout_ms".into()),
-                    Value::Integer(30_000.into()),
-                ),
-            ]),
-        )))
-        .await
-        .unwrap();
-    client
-        .write_all(&frame(&make_request(
-            "process.read_pty",
-            Value::Map(vec![
-                (
-                    Value::String("pid".into()),
-                    Value::Integer(pty_pid.expect("pty pid").into()),
-                ),
-                (
-                    Value::String("timeout_ms".into()),
-                    Value::Integer(30_000.into()),
-                ),
-            ]),
-        )))
-        .await
-        .unwrap();
-
-    // The children ignore SIGTERM and both requests are blocked on their
-    // output.  EOF must still finish after cleanup escalates to SIGKILL.
+    // Both processes push output since their start responses were written.
+    // EOF cleanup must still escalate to SIGKILL since the children ignore SIGTERM.
+    // EOF must still finish after cleanup escalates to SIGKILL.
     drop(client);
     drop(client_reader);
     // PTY cleanup gives the direct child and its process group separate
@@ -962,173 +1029,6 @@ async fn test_connection_eof_sigkills_blocked_pipe_and_pty_requests() {
             Err(nix::errno::Errno::ECHILD)
         ));
     }
-}
-
-/// An over-subscribed general pool must queue rather than reject, while a
-/// control request still overtakes the backlog.  Rejecting would surface
-/// as a spurious `remote-file-error' for a perfectly valid request.
-#[tokio::test]
-async fn test_general_overload_queues_and_control_is_reserved() {
-    let _test_lock = handlers::process::test_process_map_lock().await;
-    let (mut client, server_reader) = tokio::io::duplex(4096);
-    let (server_writer, mut client_reader) = tokio::io::duplex(4096);
-    let connection = tokio::spawn(run_connection(
-        server_reader,
-        Arc::new(Mutex::new(server_writer)),
-        None,
-    ));
-
-    let start = make_request(
-        "process.start",
-        Value::Map(vec![
-            (Value::String("cmd".into()), Value::String("sleep".into())),
-            (
-                Value::String("args".into()),
-                Value::Array(vec![Value::String("30".into())]),
-            ),
-        ]),
-    );
-    client.write_all(&frame(&start)).await.unwrap();
-    let start_response = read_frame(&mut client_reader).await;
-    let pid = map_get(&start_response, "result")
-        .and_then(|result| map_get(result, "pid"))
-        .and_then(Value::as_u64)
-        .expect("process.start pid") as i64;
-
-    let read_params = || {
-        Value::Map(vec![
-            (Value::String("pid".into()), Value::Integer(pid.into())),
-            (
-                Value::String("timeout_ms".into()),
-                Value::Integer(30_000.into()),
-            ),
-        ])
-    };
-    for id in 1..=GENERAL_TASK_LIMIT as i64 {
-        client
-            .write_all(&frame(&make_request_with_id(
-                id,
-                "process.read",
-                read_params(),
-            )))
-            .await
-            .unwrap();
-    }
-    client
-        .write_all(&frame(&make_request_with_id(
-            999,
-            "process.read",
-            read_params(),
-        )))
-        .await
-        .unwrap();
-    client
-        .write_all(&frame(&make_request_with_id(
-            1000,
-            "process.kill",
-            Value::Map(vec![
-                (Value::String("pid".into()), Value::Integer(pid.into())),
-                (Value::String("signal".into()), Value::Integer(9.into())),
-            ]),
-        )))
-        .await
-        .unwrap();
-
-    // The kill answers first, from its reserved pool, even though the
-    // queued 17th read arrived before it.
-    let first = read_frame(&mut client_reader).await;
-    assert_eq!(map_get_id(&first), Some(1000));
-    assert!(map_get(&first, "error").is_none(), "kill failed: {first:?}");
-
-    // Every read, including the queued one, is eventually answered; none
-    // is rejected with a synthetic overload error.
-    let mut seen = Vec::new();
-    while seen.len() < GENERAL_TASK_LIMIT + 1 {
-        let response = read_frame(&mut client_reader).await;
-        assert_ne!(
-            map_get(&response, "error").and_then(map_get_code),
-            Some(RpcError::INTERNAL_ERROR),
-            "queued request was rejected: {response:?}"
-        );
-        seen.push(map_get_id(&response).expect("response id"));
-    }
-    seen.sort_unstable();
-    let mut expected: Vec<i64> = (1..=GENERAL_TASK_LIMIT as i64).collect();
-    expected.push(999);
-    assert_eq!(seen, expected);
-
-    drop(client);
-    connection
-        .await
-        .expect("connection task should not panic")
-        .expect("connection cleanup should succeed");
-}
-
-#[tokio::test]
-async fn test_process_write_not_blocked_by_long_poll_read() {
-    let _test_lock = handlers::process::test_process_map_lock().await;
-    let start_params = Value::Map(vec![
-        (Value::String("cmd".into()), Value::String("cat".into())),
-        (Value::String("cwd".into()), Value::String("/tmp".into())),
-    ]);
-    let start_payload = make_request("process.start", start_params);
-    let start_response = process_request(&start_payload).await;
-    assert!(
-        start_response.error.is_none(),
-        "process.start should not error"
-    );
-    let pid = map_get(start_response.result.as_ref().unwrap(), "pid")
-        .and_then(Value::as_u64)
-        .expect("process.start should return pid") as u32;
-
-    let read_payload = make_request(
-        "process.read",
-        Value::Map(vec![
-            (Value::String("pid".into()), Value::Integer(pid.into())),
-            (
-                Value::String("timeout_ms".into()),
-                Value::Integer(1_000.into()),
-            ),
-        ]),
-    );
-    let read_task = tokio::spawn(async move { process_request(&read_payload).await });
-
-    // Give the long-polling read request time to enter the handler.  If it
-    // holds the global process map lock across the read timeout,
-    // process.write below will be delayed by roughly timeout_ms.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let write_payload = make_request(
-        "process.write",
-        Value::Map(vec![
-            (Value::String("pid".into()), Value::Integer(pid.into())),
-            (
-                Value::String("data".into()),
-                Value::Binary(b"ping\n".to_vec()),
-            ),
-        ]),
-    );
-    let start = std::time::Instant::now();
-    let write_response = process_request(&write_payload).await;
-    let elapsed = start.elapsed();
-    assert!(
-        write_response.error.is_none(),
-        "process.write should not error"
-    );
-    assert!(
-        elapsed < std::time::Duration::from_millis(500),
-        "process.write was blocked behind process.read for {elapsed:?}"
-    );
-
-    let _ = read_task.await;
-    let kill_payload = make_request(
-        "process.kill",
-        Value::Map(vec![
-            (Value::String("pid".into()), Value::Integer(pid.into())),
-            (Value::String("signal".into()), Value::Integer(9.into())),
-        ]),
-    );
-    let _ = process_request(&kill_payload).await;
 }
 
 /// Test that process.run returns 128+signal for signal-killed processes.
@@ -1161,6 +1061,26 @@ async fn test_process_run_signal_exit_code() {
         })
         .expect("should have exit_code");
     assert_eq!(exit_code, 130, "SIGINT should produce exit code 128+2=130");
+    let signal = result
+        .as_map()
+        .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some("signal")))
+        .and_then(|(_, v)| v.as_i64());
+    assert_eq!(signal, Some(2), "process.run should report the signal");
+}
+
+#[test]
+fn test_exit_fields_distinguish_signal_from_exit_137() {
+    use std::os::unix::process::ExitStatusExt;
+    let fields = |raw| {
+        crate::protocol::exit_fields(Some(std::process::ExitStatus::from_raw(raw)))
+            .map(|(_, value)| value.as_i64())
+    };
+    assert_eq!(fields(137 << 8), [Some(137), None]);
+    assert_eq!(fields(libc::SIGKILL), [Some(137), Some(9)]);
+    assert_eq!(
+        crate::protocol::exit_fields(None).map(|(_, value)| value.is_nil()),
+        [true, true]
+    );
 }
 
 /// Test that process.run returns 128+signal for SIGKILL.

@@ -4,7 +4,7 @@
 
 ;; Author: Arthur Heymans <arthur@aheymans.xyz>
 ;; Assisted-by: various LLMs
-;; Version: 0.13.1
+;; Version: 0.16.0
 ;; URL: https://github.com/ArthurHeymans/emacs-tramp-rpc
 ;; Keywords: comm, processes, files
 ;; Package-Requires: ((emacs "30.1") (msgpack "0.1.1") (tramp "2.8.1.4"))
@@ -33,7 +33,7 @@
 ;; - VC mode integration works (git, etc.)
 ;;
 ;; HOW ASYNC PROCESSES WORK:
-;; Remote processes are started via RPC and polled periodically for output.
+;; Remote processes are started via RPC and the server pushes their output.
 ;; A local pipe process serves as a relay to provide Emacs process semantics.
 ;; Process filters, sentinels, and signals all work as expected.
 ;;
@@ -231,6 +231,7 @@ This is called from `tramp-multi-hop-p-hook'."
 (require 'seq)
 (require 'tramp)
 (require 'tramp-sh)
+(require 'tramp-cmds)
 (require 'tramp-cache)
 (require 'tramp-compat)
 (require 'tramp-rpc-protocol)
@@ -251,6 +252,8 @@ This is called from `tramp-multi-hop-p-hook'."
 ;; autoload-owned functions used by the full implementation below.
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 (declare-function tramp-rpc-multi-hop-p "tramp-rpc")
+(declare-function tramp-rpc-protocol-signal-description "tramp-rpc-protocol"
+                  (signal &optional os))
 
 
 ;; Helper modules register internal lifecycle callbacks when loaded.
@@ -259,7 +262,9 @@ This is called from `tramp-multi-hop-p-hook'."
 (require 'tramp-rpc-process)
 (require 'tramp-rpc-advice)
 (require 'tramp-rpc-cache)
+(require 'tramp-rpc-notify)
 (require 'tramp-rpc-magit)
+(require 'tramp-rpc-majutsu)
 
 
 (defcustom tramp-rpc-compress-file-read (fboundp 'zlib-decompress-region)
@@ -326,10 +331,9 @@ FORCE-UNCOMPRESSED is non-nil."
     (vec localname &optional beg end force-uncompressed)
   "Read bytes from LOCALNAME on VEC in bounded, pipelined RPC chunks.
 BEG and END are byte offsets.  The total length is fixed by END, or by the
-`file_size' snapshot the server reports with the first chunk when END is nil
-\(one `file.stat' fallback for servers without that field).  Concurrent
-appends are excluded; concurrent truncation can yield a short result.  If no
-size can be determined, only the first chunk is returned.
+`file_size' snapshot the server reports with the first chunk when END is nil.
+Concurrent appends are excluded; concurrent truncation can yield a short
+result.  An invalid snapshot signals when needed to plan further chunks.
 FORCE-UNCOMPRESSED is passed to `tramp-rpc--file-read-params'."
   (let* ((offset (or beg 0))
          (chunk-size (tramp-rpc--read-chunk-size vec))
@@ -350,16 +354,13 @@ FORCE-UNCOMPRESSED is passed to `tramp-rpc--file-read-params'."
             first
           (let* ((total (if end
                             (- end offset)
-                          ;; Fix the END-nil read length to one size snapshot:
-                          ;; prefer the fstat `file_size' the server sent with
-                          ;; the first chunk (no extra RPC); fall back to one
-                          ;; `file.stat' for older servers.
-                          (max 0 (- (or (alist-get 'file_size first-result)
-                                        (alist-get 'size
-                                                   (tramp-rpc--call-file-stat
-                                                    vec localname))
-                                         received)
-                                    offset))))
+                          (let ((file-size (alist-get 'file_size first-result)))
+                            (unless (and (integerp file-size) (>= file-size 0))
+                              (signal 'remote-file-error
+                                      (list "RPC"
+                                            (format "Invalid file.read size snapshot: %S"
+                                                    file-size))))
+                            (max 0 (- file-size offset)))))
                  (next-offset (+ offset received))
                  (remaining (max 0 (- total received)))
                  (pieces (list first))
@@ -399,46 +400,62 @@ FORCE-UNCOMPRESSED is passed to `tramp-rpc--file-read-params'."
 ;; File name handler operations
 ;; ============================================================================
 
-(defun tramp-rpc--mode-executable-p (mode-string remote-uid remote-gid attrs groups)
-  "Return non-nil when MODE-STRING permits the remote user to execute ATTRS.
-REMOTE-UID is the remote user ID.
-REMOTE-GID is the remote group ID."
-  (if (equal remote-uid tramp-root-id-integer)
-      ;; Root may execute only when some execute bit is set.
-      (or (memq (aref mode-string 3) '(?x ?s))
-          (memq (aref mode-string 6) '(?x ?s))
-          (memq (aref mode-string 9) '(?x ?t)))
-    (or
-     ;; World executable.
-     (memq (aref mode-string 9) '(?x ?t))
-     ;; Owner executable.
-     (and (memq (aref mode-string 3) '(?x ?s))
-          (equal remote-uid (file-attribute-user-id attrs)))
-     ;; Group executable and we are in that group.
-     (and (memq (aref mode-string 6) '(?x ?s))
-          (or (equal remote-gid (file-attribute-group-id attrs))
-              (member (file-attribute-group-id attrs) groups))))))
+(defun tramp-rpc--call-file-access (vec localname mode &optional check-parent)
+  "Return the kernel access decision for MODE on LOCALNAME on VEC.
+The result contains errno (zero on success) and a message on failure.
+MODE is a string of r/w/x flags; empty checks existence.  CHECK-PARENT
+requests an immediate parent write/search check for a missing write target.
+RPC failures and malformed responses signal, not permission denials."
+  (let* ((result (tramp-rpc--call
+                  vec "file.access"
+                  (append (tramp-rpc--encode-path localname)
+                          `((mode . ,mode))
+                          (when check-parent
+                            '((check_parent_if_missing . t))))))
+         (errno (and (listp result) (alist-get 'errno result))))
+    (unless (and (integerp errno) (>= errno 0)
+                 (or (zerop errno) (stringp (alist-get 'message result))))
+      (error "Invalid file.access response: %S" result))
+    result))
+
+(defun tramp-rpc--check-file-access (vec localname mode)
+  "Check MODE access to LOCALNAME on VEC, returning t or signaling.
+Map kernel denials to the same error types as native `access-file'."
+  (let* ((result (tramp-rpc--call-file-access vec localname mode))
+         (errno (alist-get 'errno result)))
+    (unless (zerop errno)
+      (signal (pcase errno
+                (2 'file-missing) ; ENOENT on Linux and macOS
+                (13 'permission-denied) ; EACCES
+                (17 'file-already-exists) ; EEXIST
+                (_ 'file-error))
+              (list (alist-get 'message result)
+                    (tramp-make-tramp-file-name vec localname))))
+    t))
+
+(defun tramp-rpc--file-access-p (filename mode)
+  "Return whether FILENAME permits MODE, using a route-aware cache.
+MODE is r/w/x or the symbol `directory' for directory search access.
+Only a missing file's write check falls back to its immediate parent."
+  (with-parsed-tramp-file-name (expand-file-name filename) nil
+    (or (and (eq mode 'directory) non-essential
+             (or (tramp-string-empty-or-nil-p localname)
+                 (string-equal localname "/")))
+        (when (tramp-connectable-p v)
+          (let ((property (tramp-rpc--file-property-key v localname mode)))
+            (with-tramp-file-property v localname property
+              (let* ((directory (eq mode 'directory))
+                     ;; Resolving /./ checks directory search permission.
+                     (path (if directory
+                               (concat (file-name-as-directory localname) "./")
+                             localname))
+                     (result (tramp-rpc--call-file-access
+                              v path (if directory "" mode) (equal mode "w"))))
+                (zerop (alist-get 'errno result)))))))))
 
 (defun tramp-rpc-handle-file-executable-p (filename)
-  "Like `file-executable-p' for TRAMP-RPC files.
-Checks execute permission from `file-attributes' mode string and
-the remote uid/gid.  No dedicated RPC call needed.
-For symlinks, follows through to the target (like
-`tramp-handle-file-readable-p' does).
-FILENAME is the file name being handled."
-  (with-parsed-tramp-file-name (expand-file-name filename) nil
-    (with-tramp-file-property v localname "file-executable-p"
-      (when-let* ((attrs (file-attributes filename 'integer)))
-        (if (stringp (file-attribute-type attrs))
-            ;; Symlink: follow it and check the target.
-            (file-executable-p (file-truename filename))
-          ;; Regular file or directory: check mode bits.
-          (when-let* ((mode-string (file-attribute-modes attrs))
-                      (remote-uid (tramp-get-remote-uid v 'integer))
-                      (remote-gid (tramp-get-remote-gid v 'integer)))
-            (tramp-rpc--mode-executable-p
-             mode-string remote-uid remote-gid attrs
-             (tramp-get-remote-groups v 'integer))))))))
+  "Like `file-executable-p' for TRAMP-RPC FILENAME."
+  (tramp-rpc--file-access-p filename "x"))
 
 (defun tramp-rpc--call-file-stat (vec localname &optional lstat)
   "Call file.stat for LOCALNAME on VEC, returning nil if file doesn't exist.
@@ -522,14 +539,24 @@ FILENAME is the file name being handled."
                 (cached cached)))
              (cached cached)))))))))
 
+(defun tramp-rpc-handle-file-accessible-directory-p (filename)
+  "Like `file-accessible-directory-p' for TRAMP-RPC FILENAME.
+A directory must be searchable, not necessarily readable."
+  (tramp-rpc--file-access-p filename 'directory))
+
 (defun tramp-rpc-handle-file-readable-p (filename)
-  "Like `file-readable-p' for TRAMP-RPC files.
-For cached-missing marker files, avoid delegating to TRAMP's generic handler,
-which would otherwise perform another remote stat.
-FILENAME is the file name being handled."
-  (pcase (tramp-rpc-magit--file-exists-p filename)
+  "Like `file-readable-p' for TRAMP-RPC FILENAME.
+Use cached missing marker results, otherwise ask the remote kernel."
+  (pcase (if (eq remote-file-name-inhibit-cache t)
+             'not-cached
+           (tramp-rpc-magit--file-exists-p filename))
     ('nil nil)
-    (_ (tramp-handle-file-readable-p filename))))
+    (_ (tramp-rpc--file-access-p filename "r"))))
+
+(defun tramp-rpc-handle-file-writable-p (filename)
+  "Like `file-writable-p' for TRAMP-RPC FILENAME.
+For missing files, check write and search access to the immediate parent."
+  (tramp-rpc--file-access-p filename "w"))
 
 (defun tramp-rpc-handle-file-regular-p (filename)
   "Like `file-regular-p' for TRAMP-RPC files.
@@ -553,26 +580,31 @@ FILENAME is the file name being handled."
         result))))
 
 (defun tramp-rpc-handle-access-file (filename string)
-  "Like `access-file' for TRAMP-RPC files.
-FILENAME is the file name being checked.
+  "Like `access-file' for TRAMP-RPC FILENAME.
+Check read access directly, without metadata or predicate caches.
 STRING is prepended to any resulting error message."
-  (condition-case err
-      (tramp-handle-access-file filename string)
-    (file-error
-     (let* ((target (file-symlink-p filename))
-            (target-file
-             (and target
-                  (if (file-name-absolute-p target)
-                      (with-parsed-tramp-file-name filename nil
-                        (tramp-make-tramp-file-name v target))
-                    (expand-file-name target (file-name-directory filename))))))
-       (if (and target
-                (not (file-exists-p filename))
-                ;; Preserve symlink-cycle errors; only dangling links are missing.
-                (not (file-symlink-p target-file)))
-           (signal 'file-missing (cdr err))
-         (signal (car err) (cdr err)))))))
-
+  (let ((timeout (bound-and-true-p remote-file-name-access-timeout))
+        (v (tramp-dissect-file-name
+            (if (file-name-absolute-p filename) filename default-directory)))
+        (tramp-dont-suspend-timers t))
+    (with-tramp-timeout
+        (timeout
+         (unless (and (not non-essential) (tramp-connectable-p v))
+           (tramp-cleanup-connection v 'keep-debug 'keep-password))
+         (tramp-error
+          v 'file-error
+          (format "%s: Timeout %s second(s) accessing %s"
+                  string timeout filename)))
+      (with-parsed-tramp-file-name (expand-file-name filename) nil
+        (unless (tramp-connectable-p v)
+          (tramp-error v 'file-error "%s: Connection unavailable, %s"
+                       string filename))
+        (condition-case err
+            (progn
+              (tramp-rpc--check-file-access v localname "r")
+              nil)
+          (file-error
+           (signal (car err) (cons string (cdr err)))))))))
 
 (defun tramp-rpc-handle-file-truename (filename)
   "Like `file-truename' for TRAMP-RPC files.
@@ -1153,8 +1185,7 @@ MUSTBENEW requests an overwrite check; `excl' rejects an existing file."
                              ,@(when (integerp append)
                                  `((offset . ,append)))))))
 
-      (let ((tramp-rpc--suppress-fs-notifications t))
-        (tramp-rpc--call v "file.write" params))
+      (tramp-rpc--call v "file.write" params)
 
       ;; Invalidate caches for the written file
       (tramp-rpc--invalidate-cache-for-path filename)
@@ -1473,8 +1504,11 @@ PRESERVE-PERMISSIONS non-nil preserves file permissions."
 
      ;; Remote source, local dest - read via RPC, write locally
      ((and source-remote (not dest-remote))
-      ;; Use file-local-copy to get a temp local copy, then rename
-      (let ((tmpfile (file-local-copy filename)))
+      ;; Inhibit jka-compr so that compressed file extensions (e.g. .gz)
+      ;; do not cause decompression during file-local-copy or the subsequent
+      ;; write to the tmpfile inside tramp-rpc-handle-file-local-copy.
+      (let ((tmpfile (let ((jka-compr-inhibit t))
+                       (file-local-copy filename))))
         (unwind-protect
             (progn
               (rename-file tmpfile newname ok-if-already-exists)
@@ -1678,7 +1712,8 @@ TRASH non-nil requests moving the file to the trash."
 
 (defun tramp-rpc--write-local-trash-file (filename content stat)
   "Write CONTENT as binary data to local trash FILENAME and apply STAT."
-  (let ((coding-system-for-write 'binary))
+  (let ((jka-compr-inhibit t)
+        (coding-system-for-write 'binary))
     (with-temp-buffer
       (set-buffer-multibyte nil)
       (insert content)
@@ -1960,20 +1995,6 @@ containing FILENAME."
                 (alist-get 'available result)))
       (error nil))))
 
-(defun tramp-rpc-handle-get-remote-groups (vec id-format)
-  "Return remote groups using RPC.
-ID-FORMAT specifies whether to return integer GIDs or string names.
-VEC is the TRAMP connection vector."
-  (condition-case nil
-      (let ((result (tramp-rpc--call vec "system.groups" nil)))
-        (mapcar (lambda (g)
-                  (if (eq id-format 'integer)
-                      (alist-get 'gid g)
-                    (or (tramp-rpc--decode-string (alist-get 'name g))
-                        (number-to-string (alist-get 'gid g)))))
-                result))
-    (error nil)))
-
 ;; ============================================================================
 ;; ACL Support
 ;; ============================================================================
@@ -2122,6 +2143,15 @@ an Emacs buffer, matching `call-process' and `process-file'."
       (eq (car destination) :file)
       (eq (cadr destination) t)))
 
+(defun tramp-rpc--process-file-cache-output-p (destination)
+  "Return non-nil if stdout-only cache entries satisfy DESTINATION.
+Discarded output and (STDOUT nil) destinations do not need stderr.  Other
+forms must run the process to capture diagnostics and merged stream ordering."
+  (or (null destination)
+      (and (consp destination)
+           (not (eq (car destination) :file))
+           (null (cadr destination)))))
+
 (defun tramp-rpc--route-process-file-output (destination stdout &optional stderr)
   "Route `process-file' STDOUT and STDERR according to DESTINATION.
 DESTINATION follows the `process-file' convention: nil discards output; t,
@@ -2161,25 +2191,17 @@ signal numbers to human-readable strings like \"Interrupt\" or
            ;; Prepend a placeholder 0 for signal 0 so that (nth 1 signals)
            ;; corresponds to signal 1 (HUP), (nth 2 signals) to signal 2 (INT), etc.
            (signals (cons 0 raw-signals))
-           (vec-strings (make-vector 128 nil)))
+           (vec-strings (make-vector 128 nil))
+           (os (alist-get 'os (tramp-rpc--cached-system-info vec))))
       ;; Sanity: remove duplicate leading "0" entry if kill -l included one
       (when (and (stringp (cadr signals)) (string-equal (cadr signals) "0"))
         (setcdr signals (cddr signals)))
-      ;; Map signal names to human-readable strings
+      ;; Map signal names to human-readable strings matching local Emacs.
       (dotimes (i 128)
         (let ((sig (nth i signals)))
           (aset vec-strings i
-                (cond
-                 ((zerop i) 0)
-                 ((null sig) (format "Signal %d" i))
-                 ((string-equal sig "HUP") "Hangup")
-                 ((string-equal sig "INT") "Interrupt")
-                 ((string-equal sig "QUIT") "Quit")
-                 ((string-equal sig "STOP") "Stopped (signal)")
-                 ((string-equal sig "TSTP") "Stopped")
-                 ((string-equal sig "TTIN") "Stopped (tty input)")
-                 ((string-equal sig "TTOU") "Stopped (tty output)")
-                 (t (format "Signal %d" i))))))
+                (if (zerop i) 0
+                  (tramp-rpc-protocol-signal-description (or sig i) os)))))
       vec-strings)))
 
 (defun tramp-rpc-handle-process-file
@@ -2196,8 +2218,10 @@ ARGS contains the original function arguments."
     ;; Unquote localname in case of file-name-quoted paths (e.g. /: prefix).
     (setq localname (file-name-unquote localname))
     ;; Try serving from magit prefetch cache first (no RPC needed)
-    (let ((cached (when (null infile)  ; no stdin redirection
-                    (tramp-rpc-magit--process-cache-lookup program args))))
+    (let* ((cache-output-p (and (null infile)
+                                (tramp-rpc--process-file-cache-output-p destination)))
+           (cached (when cache-output-p
+                     (tramp-rpc-magit--process-cache-lookup program args))))
       (if cached
           ;; Cache hit - serve from prefetch
           (let ((exit-code (car cached))
@@ -2233,8 +2257,12 @@ ARGS contains the original function arguments."
                             (args . ,(vconcat args))
                             (cwd . ,localname)
                             (env . ,env)
-                            ,@(when (tramp-rpc--process-file-merge-output-p
-                                     destination)
+                            ;; Discarded output does not need a merged stream.
+                            ;; Keep stdout separate so exit-code-only Magit
+                            ;; calls can still populate the stdout-only cache.
+                            ,@(when (and destination
+                                         (tramp-rpc--process-file-merge-output-p
+                                          destination))
                                 '((merge_stderr . t)))
                             ,@(when stdin-content
                                 `((stdin . ,stdin-content)))))
@@ -2250,26 +2278,29 @@ ARGS contains the original function arguments."
                     127
                   (if result
                       (let ((exit-code (alist-get 'exit_code result))
+                            (exit-signal (alist-get 'signal result))
                             (stdout (tramp-rpc--decode-output
                                      (alist-get 'stdout result)))
                             (stderr (tramp-rpc--decode-output
                                      (alist-get 'stderr result))))
 
-                        ;; Memoize uncached Magit git calls made during lazy
-                        ;; remote status expansion.
-                        (when (null infile)
+                        ;; Never let merged diagnostics poison stdout-only
+                        ;; cache entries used by subsequent Magit calls.
+                        (when cache-output-p
                           (tramp-rpc-magit--process-cache-store
                            program args exit-code stdout))
 
                         ;; Let the real `update-index --refresh' run, then
                         ;; build the read snapshot used by later Magit calls.
+                        ;; It exits 1 when tracked files need an update, which
+                        ;; is the usual state of a worktree with changes.
                         (when (and
                                (null infile)
                                (bound-and-true-p
                                 tramp-rpc-magit--allow-process-cache)
                                (or (string-suffix-p "/git" program)
                                    (string= "git" program))
-                               (= exit-code 0)
+                               (memql exit-code '(0 1))
                                (tramp-rpc-magit--git-cache-safe-environment-p))
                           (let ((core-args
                                  (tramp-rpc-magit--strip-git-prefix-args args)))
@@ -2282,14 +2313,23 @@ ARGS contains the original function arguments."
                         (tramp-rpc--route-process-file-output
                          destination stdout stderr)
 
-                        ;; Handle signal strings when requested by Emacs.
-                        (if (and
-                             (bound-and-true-p
-                              process-file-return-signal-string)
-                             (natnump exit-code) (>= exit-code 128))
-                            (let ((strings (tramp-rpc--get-signal-strings v)))
-                              (aref strings (- exit-code 128)))
-                          exit-code))
+                        ;; `process-file' returns the raw exit code unless the
+                        ;; caller opts into signal descriptions via
+                        ;; `process-file-return-signal-string'.  This matches
+                        ;; tramp-sh and upstream `tramp-test28-process-file',
+                        ;; which requires the integer 128 + signal by default.
+                        (cond
+                         ((not (bound-and-true-p
+                                process-file-return-signal-string))
+                          exit-code)
+                         ((natnump exit-signal)
+                          (aref (tramp-rpc--get-signal-strings v) exit-signal))
+                         ;; Like tramp-sh, describe other exits above 128 as
+                         ;; signals when opted in.  Exit 128 is not a signal.
+                         ((and (natnump exit-code) (> exit-code 128))
+                          (aref (tramp-rpc--get-signal-strings v)
+                                (- exit-code 128)))
+                         (t exit-code)))
                     ;; A successful RPC result is always non-nil.
                     (signal 'remote-file-error
                             (list "Empty process.run response")))))
@@ -2371,10 +2411,13 @@ REPLACE non-nil replaces the accessible buffer contents."
 (defun tramp-rpc-handle-file-local-copy (filename)
   "Create a local copy of remote FILENAME using RPC."
   (tramp-skeleton-file-local-copy filename
-    (let ((content (tramp-rpc--read-file-bytes v localname)))
-      (with-temp-file tmpfile
+    (let ((content (tramp-rpc--read-file-bytes v localname))
+          (jka-compr-inhibit t)
+          (coding-system-for-write 'binary))
+      (with-temp-buffer
         (set-buffer-multibyte nil)
-        (insert content)))))
+        (insert content)
+        (write-region (point-min) (point-max) tmpfile nil 0)))))
 
 (defun tramp-rpc-handle-get-home-directory (vec &optional user)
   "Return home directory for USER on remote host VEC using RPC.
@@ -2460,8 +2503,14 @@ signalling an error.
 `tramp-verbose' is suppressed during the first attempt because
 `tramp-error' logs a level-1 message before signalling, which
 would otherwise flood the echo area with \"Cannot expand tilde\".
-NAME identifies the connection.
-DIR is the directory being handled."
+Relative NAME is resolved against DIR or `default-directory' before
+expanding a relative remote localname against the remote home directory."
+  ;; Like `tramp-handle-expand-file-name', combine NAME and DIR first so
+  ;; the home-relative normalization also sees a remote directory supplied
+  ;; through DIR or `default-directory'.
+  (unless (file-name-absolute-p name)
+    (setq name (file-name-concat (or dir default-directory "/")
+                                 (if (string-empty-p name) "." name))))
   ;; The generic `tramp-handle-expand-file-name' defaults non-absolute
   ;; localnames to "/" (root), but the ssh handler
   ;; (`tramp-sh-handle-expand-file-name') defaults to "~/" instead.
@@ -2470,9 +2519,8 @@ DIR is the directory being handled."
   ;; relative to the home directory rather than the filesystem root.
   ;; Guard with `tramp-connectable-p' so that the tilde substitution is
   ;; skipped during completion when no connection exists, avoiding a
-  ;; blocking connection attempt when `non-essential' is t.  When not
-  ;; connectable the generic handler falls through to "/" (root) rather
-  ;; than the home directory — acceptable for the completion case.
+  ;; blocking connection attempt when `non-essential' is t.  Leave that
+  ;; case to the generic handler's non-connecting expansion.
   ;; Use `tramp-dissect-file-name' and `tramp-make-tramp-file-name'
   ;; instead of `file-remote-p' to avoid re-entering expand-file-name.
   (when (tramp-tramp-file-p name)
@@ -2501,516 +2549,6 @@ DIR is the directory being handled."
      (let ((tramp-tolerate-tilde t))
        (tramp-handle-expand-file-name name dir)))))
 
-(defvar tramp-rpc--file-notify-descriptors (make-hash-table :test 'eq)
-  "TRAMP-RPC file notification descriptors.")
-
-(defvar tramp-rpc--file-notify-watch-counts (make-hash-table :test 'equal)
-  "Reference counts for directories watched via file notifications.
-Keys are the same connection/path keys as `tramp-rpc--watched-directories'.")
-
-(defvar tramp-rpc-protocol--message-target)
-
-(declare-function file-notify--rm-descriptor "filenotify")
-(declare-function file-notify-rm-watch "filenotify")
-
-(defun tramp-rpc--file-notify-monitor (vec)
-  "Return the file notification monitor symbol for VEC."
-  (let* ((info (condition-case err
-                   (tramp-rpc--system-info vec)
-                 (error
-                  (tramp-rpc--debug "system.info probe failed: %s"
-                                    (error-message-string err))
-                  nil)))
-         (watcher (and (listp info)
-                       (tramp-rpc--decode-string (alist-get 'watcher info))))
-         (os (and (listp info)
-                  (tramp-rpc--decode-string (alist-get 'os info)))))
-    (pcase watcher
-      ("inotify" 'TrampRPCinotify)
-      ("kqueue" 'TrampRPCkqueue)
-      ("fsevent" 'TrampRPCfsevent)
-      ("poll" 'TrampRPCpoll)
-      ((pred null)
-       (pcase os
-         ("linux" 'TrampRPCinotify)
-         ((or "freebsd" "openbsd" "netbsd" "dragonfly" "ios")
-          'TrampRPCkqueue)
-         ("macos" 'TrampRPCfsevent)
-         (_ 'TrampRPC)))
-      (_ 'TrampRPC))))
-
-(defun tramp-rpc--file-notify-process-sentinel (descriptor event)
-  "Clean up file notification DESCRIPTOR after EVENT closes it."
-  (unless (process-live-p descriptor)
-    (tramp-rpc--debug "file-notify descriptor closed: %S %s" descriptor event)
-    ;; `file-notify-rm-watch' calls the file-name handler, which deletes the
-    ;; descriptor process.  Avoid re-entering it for that intentional close.
-    (unless (process-get descriptor 'tramp-rpc-file-notify-removing)
-      (file-notify-rm-watch descriptor))))
-
-(defun tramp-rpc--make-file-notify-descriptor (vec _directory localname)
-  "Create a TRAMP-style process descriptor for a file notification watch.
-VEC is the TRAMP connection vector.
-LOCALNAME is the local file name."
-  (let* (;; Emacs' remote file notification tests use the process name to
-         ;; identify the remote library.  The concrete backend is exposed via
-         ;; the "file-monitor" connection property below.
-         (name "tramp-rpc")
-         ;; This synthetic process is only a watch descriptor; it never
-         ;; receives output.  Do not attach a buffer: `global-auto-revert-mode'
-         ;; iterates over `buffer-list' while removing file notification
-         ;; watches, and deleting descriptor buffers during that iteration can
-         ;; make Emacs select a just-deleted buffer.
-         (descriptor (make-pipe-process
-                      :name name
-                      :noquery t
-                      :sentinel #'tramp-rpc--file-notify-process-sentinel)))
-    ;; These two properties are the ones TRAMP's generic file-notify routing and
-    ;; validity helpers expect on watch descriptors.
-    (process-put descriptor 'tramp-vector vec)
-    (process-put descriptor 'tramp-watch-name localname)
-    ;; Match gio/smb-notify: tests can use the library name for broad behavior
-    ;; and this property for backend-specific expectations.
-    (tramp-set-connection-property
-     descriptor "file-monitor" (tramp-rpc--file-notify-monitor vec))
-    ;; RPC-private metadata lives in `tramp-rpc--file-notify-descriptors', but
-    ;; mark the process as ours for debugging and defensive cleanup.
-    (process-put descriptor 'tramp-rpc-file-notify t)
-    descriptor))
-
-(defun tramp-rpc--delete-file-notify-descriptor-process (descriptor)
-  "Delete DESCRIPTOR's synthetic process."
-  (when (processp descriptor)
-    (process-put descriptor 'tramp-rpc-file-notify-removing t)
-    (when (process-live-p descriptor)
-      (delete-process descriptor))))
-
-(defun tramp-rpc--canonical-directory-equal-p (a b)
-  "Return non-nil if canonical directory names A and B are equal."
-  (and (stringp a)
-       (stringp b)
-       (string= (directory-file-name a) (directory-file-name b))))
-
-(defun tramp-rpc--watch-entry-canonical-directory (entry)
-  "Return canonical directory recorded in watch ENTRY."
-  (or (plist-get entry :canonical-directory)
-      (plist-get entry :directory)))
-
-(defun tramp-rpc--canonical-watch-active-p (canonical-directory)
-  "Return non-nil if CANONICAL-DIRECTORY still has a client-side owner.
-Both explicit watch entries and file-notify watch entries count as owners."
-  (let (active)
-    (when (and (stringp canonical-directory)
-               (hash-table-p tramp-rpc--watched-directories))
-      (maphash
-       (lambda (_key entry)
-         (when (tramp-rpc--canonical-directory-equal-p
-                canonical-directory
-                (tramp-rpc--watch-entry-canonical-directory entry))
-           (setq active t)))
-       tramp-rpc--watched-directories))
-    (when (and (not active)
-               (stringp canonical-directory)
-               (hash-table-p tramp-rpc--file-notify-watch-counts))
-      (maphash
-       (lambda (_key entry)
-         (when (and (plist-get entry :count)
-                    (tramp-rpc--canonical-directory-equal-p
-                     canonical-directory
-                     (tramp-rpc--watch-entry-canonical-directory entry)))
-           (setq active t)))
-       tramp-rpc--file-notify-watch-counts))
-    active))
-
-(defun tramp-rpc--cleanup-file-notify-for-connection
-    (&optional vec connection-process)
-  "Remove file notification state for VEC's CONNECTION-PROCESS.
-When VEC is nil, remove all state."
-  (let* ((prefix (and vec (concat (tramp-rpc--connection-key-string vec) ":")))
-         (descriptors-to-remove nil)
-         (watch-keys-to-remove nil))
-    (maphash
-     (lambda (descriptor data)
-       (let* ((watch-key (plist-get data :watch-key))
-              (entry (and watch-key
-                          (gethash watch-key tramp-rpc--file-notify-watch-counts)))
-              (owner (or (plist-get data :connection-process)
-                         (plist-get entry :connection-process))))
-         (when (and (or (null prefix)
-                        (and watch-key (string-prefix-p prefix watch-key)))
-                    (or (null connection-process)
-                        (null owner)
-                        (eq connection-process owner)))
-           (push descriptor descriptors-to-remove))))
-     tramp-rpc--file-notify-descriptors)
-    (maphash
-     (lambda (watch-key data)
-       (when (and (or (null prefix) (string-prefix-p prefix watch-key))
-                  (or (null connection-process)
-                      (null (plist-get data :connection-process))
-                      (eq connection-process
-                          (plist-get data :connection-process))))
-         (push watch-key watch-keys-to-remove)))
-     tramp-rpc--file-notify-watch-counts)
-    (dolist (descriptor descriptors-to-remove)
-      ;; Remove private state before sending the public `stopped' event, so
-      ;; callbacks observing `file-notify-valid-p' during cleanup see the
-      ;; descriptor as no longer valid.
-      (remhash descriptor tramp-rpc--file-notify-descriptors)
-      (tramp-rpc--delete-file-notify-descriptor-process descriptor)
-      (when (and (boundp 'file-notify-descriptors)
-                 (gethash descriptor file-notify-descriptors))
-        (require 'filenotify)
-        (file-notify--rm-descriptor descriptor)))
-    (dolist (watch-key watch-keys-to-remove)
-      (remhash watch-key tramp-rpc--file-notify-watch-counts))
-    (when (or descriptors-to-remove watch-keys-to-remove)
-      (tramp-rpc--debug
-       "Cleaned up %d file-notify descriptors and %d file-notify watches%s"
-       (length descriptors-to-remove)
-       (length watch-keys-to-remove)
-       (if vec (format " for %s" prefix) "")))))
-
-(defun tramp-rpc--file-notify-relative-name (directory file)
-  "Return FILE's relative name under DIRECTORY, or nil.
-Only DIRECTORY itself and immediate children match.  DIRECTORY itself returns
-the empty string."
-  (let* ((dir (file-name-as-directory (directory-file-name directory)))
-         (file (directory-file-name file)))
-    (cond
-     ((string= (directory-file-name dir) file) "")
-     ((string-prefix-p dir file)
-      (let ((rest (substring file (length dir))))
-        (and (not (string-empty-p rest))
-             (not (string-match-p "/" rest))
-             rest))))))
-
-(defun tramp-rpc--file-notify-direct-child-p (directory file)
-  "Return non-nil if FILE is DIRECTORY or its immediate child."
-  (and (tramp-rpc--file-notify-relative-name directory file) t))
-
-(defun tramp-rpc--file-notify-action-enabled-p (action flags)
-  "Return non-nil when ACTION is enabled by file notification FLAGS."
-  (or (member action '("stopped"))
-      (and (memq 'change flags)
-           (member action '("created" "changed" "deleted"
-                            "renamed" "renamed-from" "renamed-to")))
-      (and (memq 'attribute-change flags)
-           (string= action "attribute-changed"))))
-
-(defun tramp-rpc--file-notify-callback-action (action)
-  "Map protocol ACTION to an action accepted by `file-notify-callback'."
-  (pcase action
-    ("created" 'created)
-    ("changed" 'changed)
-    ("attribute-changed" 'attribute-changed)
-    ("deleted" 'deleted)
-    ("renamed" 'moved)
-    ("renamed-from" 'moved-from)
-    ("renamed-to" 'moved-to)
-    ("stopped" 'unmounted)
-    (_ nil)))
-
-(defun tramp-rpc--file-notify-alias-paths (file-name)
-  "Return original watch spellings equivalent to canonical FILE-NAME."
-  (let (aliases)
-    (when (hash-table-p tramp-rpc--file-notify-descriptors)
-      (maphash
-       (lambda (_descriptor data)
-         (when-let* ((canonical-directory
-                      (tramp-rpc--file-notify-canonical-directory data))
-                     ((tramp-rpc--file-notify-relative-name
-                       canonical-directory file-name))
-                     (alias
-                      (tramp-rpc--file-notify-original-spelling
-                       data file-name))
-                     ((not (string= alias file-name))))
-           (cl-pushnew alias aliases :test #'string=)))
-       tramp-rpc--file-notify-descriptors))
-    aliases))
-
-(defun tramp-rpc--file-notify-canonical-directory (data)
-  "Return the canonical directory associated with descriptor DATA."
-  (let* ((watch-key (plist-get data :watch-key))
-         (watch-entry (and watch-key
-                           (gethash watch-key
-                                    tramp-rpc--file-notify-watch-counts))))
-    ;; Prefer the shared watch entry, because explicit unwatch can restore a
-    ;; file-notify-owned direct watch and learn a newer canonical path after
-    ;; descriptors were created.
-    (or (plist-get watch-entry :canonical-directory)
-        (plist-get data :canonical-directory))))
-
-(defun tramp-rpc--file-notify-original-spelling (data file-name)
-  "Return FILE-NAME rewritten to descriptor DATA's original watch spelling."
-  (let* ((canonical-directory
-          (tramp-rpc--file-notify-canonical-directory data))
-         (directory (plist-get data :directory))
-         (relative (and canonical-directory directory
-                        (tramp-rpc--file-notify-relative-name
-                         canonical-directory file-name))))
-    (if relative
-        (if (string-empty-p relative)
-            (directory-file-name directory)
-          (expand-file-name relative directory))
-      file-name)))
-
-(defun tramp-rpc--file-notify-callback-name (data file-name)
-  "Return FILE-NAME in the form expected by `file-notify-callback'.
-`file-notify-callback' expands backend file names relative to the
-watch directory stored in `file-notify-descriptors'.  Passing an
-already expanded TRAMP name can therefore produce doubled remote
-prefixes on some TRAMP versions.  Prefer the name relative to the
-original watched directory, falling back to the original spelling when
-we cannot derive one.
-DATA is the payload to send."
-  (let* ((display-file-name
-          (tramp-rpc--file-notify-original-spelling data file-name))
-         (directory (plist-get data :directory))
-         (relative (and directory
-                        (tramp-rpc--file-notify-relative-name
-                         directory display-file-name))))
-    (cond
-     ((null relative) display-file-name)
-     ((string-empty-p relative) ".")
-     (t relative))))
-
-(defun tramp-rpc--file-notify-path-matches-p (data file-name)
-  "Return non-nil if descriptor DATA covers FILE-NAME."
-  (let ((canonical-directory
-         (tramp-rpc--file-notify-canonical-directory data)))
-    (or (tramp-rpc--file-notify-direct-child-p
-         (plist-get data :directory) file-name)
-        ;; The server registers canonical watch paths and can report events
-        ;; using that canonical spelling.  Keep the original directory for
-        ;; Emacs' public descriptor table, but also match against the
-        ;; canonical directory returned by `watch.add' when it differs (for
-        ;; example, symlinked watched directories).
-        (and canonical-directory
-             (tramp-rpc--file-notify-direct-child-p
-              canonical-directory file-name)))))
-
-(defun tramp-rpc--file-notify-synthetic-watch-p (file-name)
-  "Return non-nil if FILE-NAME is covered by a synthetic symlink watch."
-  (let (matched)
-    (when (hash-table-p tramp-rpc--file-notify-descriptors)
-      (maphash
-       (lambda (_descriptor data)
-         (let* ((watch-key (plist-get data :watch-key))
-                (entry (and watch-key
-                            (gethash watch-key
-                                     tramp-rpc--file-notify-watch-counts))))
-           (when (and (plist-get entry :synthetic)
-                      (tramp-rpc--file-notify-path-matches-p data file-name))
-             (setq matched t))))
-       tramp-rpc--file-notify-descriptors))
-    matched))
-
-(defun tramp-rpc--file-notify-dispatch-descriptor
-    (descriptor data action file-name &optional file-name1 cookie)
-  "Dispatch ACTION for one selected DESCRIPTOR using its watch DATA.
-FILE-NAME1 is the destination for rename events.  COOKIE pairs tracked renames."
-  (when-let* ((callback-action (tramp-rpc--file-notify-callback-action action)))
-    ;; `file-notify-callback' and the special-event handler live in
-    ;; filenotify.el.  It is normally loaded before watches are registered.
-    (require 'filenotify)
-    (let* ((display-file-name
-            (tramp-rpc--file-notify-callback-name data file-name))
-           (display-file-name1
-            (and file-name1
-                 (tramp-rpc--file-notify-callback-name data file-name1)))
-           (event-data (append (list descriptor (list callback-action)
-                                     display-file-name)
-                               (cond
-                                (display-file-name1 (list display-file-name1))
-                                (cookie (list cookie)))))
-           (event `(file-notify ,event-data file-notify-callback)))
-      (if (fboundp 'insert-special-event)
-          (insert-special-event event)
-        (funcall (lookup-key special-event-map [file-notify]) event)))))
-
-(defun tramp-rpc--file-notify-dispatch-rescan (connection-process)
-  "Dispatch conservative events for live watches on CONNECTION-PROCESS."
-  (let (dispatches)
-    ;; Select concrete descriptors before dispatch.  Feeding their directories
-    ;; through the path router would also reach dead or replacement-generation
-    ;; descriptors that happen to watch the same spelling.
-    (maphash
-     (lambda (descriptor data)
-       (when (and (process-live-p descriptor)
-                  (eq connection-process
-                      (plist-get data :connection-process)))
-         (let ((directory (plist-get data :directory))
-               (flags (plist-get data :flags)))
-           (when (memq 'change flags)
-             (push (list descriptor data "changed" directory) dispatches))
-           (when (memq 'attribute-change flags)
-             (push (list descriptor data "attribute-changed" directory)
-                   dispatches)))))
-     tramp-rpc--file-notify-descriptors)
-    (dolist (dispatch dispatches)
-      (apply #'tramp-rpc--file-notify-dispatch-descriptor dispatch))))
-
-(defun tramp-rpc--file-notify-dispatch (action file-name &optional file-name1 cookie)
-  "Dispatch a `file-notify' ACTION for TRAMP FILE-NAME.
-FILE-NAME1 is the destination for `renamed' events.  COOKIE pairs
-`renamed-from' and `renamed-to' events when the server provides one."
-  (when (and (hash-table-p tramp-rpc--file-notify-descriptors)
-             (> (hash-table-count tramp-rpc--file-notify-descriptors) 0)
-             (tramp-rpc--file-notify-callback-action action))
-    (let (descriptors)
-      (maphash
-       (lambda (descriptor data)
-         (when (and (tramp-rpc--file-notify-action-enabled-p
-                     action (plist-get data :flags))
-                    (or (tramp-rpc--file-notify-path-matches-p data file-name)
-                        (and file-name1
-                             (tramp-rpc--file-notify-path-matches-p
-                              data file-name1))))
-           (push (cons descriptor data) descriptors)))
-       tramp-rpc--file-notify-descriptors)
-      (dolist (descriptor-data descriptors)
-        (tramp-rpc--file-notify-dispatch-descriptor
-         (car descriptor-data) (cdr descriptor-data)
-         action file-name file-name1 cookie)))))
-
-(defun tramp-rpc-handle-file-notify-add-watch (directory flags _callback)
-  "Like `file-notify-add-watch' for TRAMP-RPC files.
-DIRECTORY is the remote directory passed by `file-notify-add-watch'.
-FLAGS controls the requested operation."
-  ;; `file-notify-add-watch' validates FLAGS and CALLBACK before invoking file
-  ;; name handlers, and stores the callback in `file-notify-descriptors' after
-  ;; this handler returns.  We only need to create a distinct descriptor and
-  ;; ensure the corresponding remote directory is watched.
-  (require 'filenotify)
-  (with-parsed-tramp-file-name directory nil
-    (let* ((watch-key (format "%s:%s" (tramp-rpc--connection-key-string v)
-                              localname))
-           (entry (gethash watch-key tramp-rpc--file-notify-watch-counts))
-           (preexisting (gethash watch-key tramp-rpc--watched-directories))
-           ;; file-notify does not follow symlinks.  Ask the server for a
-           ;; nofollow symlink watch when needed, falling back to a synthetic
-           ;; client-side descriptor on platforms without nofollow support.
-           (symlink-watch
-            (condition-case err
-                (file-symlink-p directory)
-              (error
-               (tramp-rpc--debug "symlink watch probe failed for %s: %s"
-                                 directory (error-message-string err))
-               nil)))
-           (descriptor (tramp-rpc--make-file-notify-descriptor
-                        v directory localname)))
-      (if entry
-          (plist-put entry :count (1+ (plist-get entry :count)))
-        ;; Keep file-notify's non-recursive watches out of
-        ;; `tramp-rpc--watched-directories'.  That table is also used by Magit
-        ;; and cache invalidation, where a truthy entry means a recursive
-        ;; worktree/cache watch may already exist.
-        (let* ((synthetic nil)
-               (result (cond
-                        (symlink-watch
-                         (if preexisting
-                             (progn
-                               (setq synthetic symlink-watch)
-                               nil)
-                           (condition-case err
-                               (tramp-rpc--call
-                                v "watch.add"
-                                `((path . ,localname)
-                                  (recursive . :msgpack-false)
-                                  (nofollow . t)))
-                             (error
-                              (setq synthetic symlink-watch)
-                              (tramp-rpc--debug
-                               "nofollow file-notify watch unsupported for %s: %s"
-                               directory (error-message-string err))
-                              nil))))
-                        (preexisting nil)
-                        (t
-                         (tramp-rpc--call v "watch.add"
-                                          `((path . ,localname)
-                                            (recursive . :msgpack-false))))))
-               (canonical-localname (and (listp result)
-                                         (alist-get 'path result)))
-               (canonical-directory (cond
-                                     ((and (stringp canonical-localname)
-                                           (tramp-tramp-file-p canonical-localname))
-                                      canonical-localname)
-                                     ((stringp canonical-localname)
-                                      (tramp-make-tramp-file-name
-                                       v canonical-localname))
-                                     ;; If the server watch preexisted, there
-                                     ;; is no `watch.add' response to learn its
-                                     ;; canonical spelling from.  Use TRAMP's
-                                     ;; truename path as a best-effort match key
-                                     ;; for symlinked watched directories.
-                                     (preexisting
-                                      (condition-case err
-                                          (file-truename directory)
-                                        (error
-                                         (tramp-rpc--debug
-                                          "watch truename probe failed for %s: %s"
-                                          directory
-                                          (error-message-string err))
-                                         nil))))))
-          (puthash watch-key
-                   (list :count 1
-                         :owned (and (not preexisting) (not synthetic))
-                         :synthetic synthetic
-                         :directory directory
-                         :canonical-directory canonical-directory
-                         :connection-process (tramp-rpc--connection-transport (tramp-rpc--get-connection v)))
-                   tramp-rpc--file-notify-watch-counts)))
-      (let ((watch-entry (gethash watch-key tramp-rpc--file-notify-watch-counts)))
-        (puthash descriptor
-                 (list :directory directory
-                       :canonical-directory (plist-get watch-entry
-                                                       :canonical-directory)
-                       :flags flags
-                       :localname localname
-                       :watch-key watch-key
-                       :connection-process (tramp-rpc--connection-transport (tramp-rpc--get-connection v)))
-                 tramp-rpc--file-notify-descriptors))
-      descriptor)))
-
-(defun tramp-rpc-handle-file-notify-rm-watch (descriptor)
-  "Like `file-notify-rm-watch' for TRAMP-RPC watch DESCRIPTOR."
-  (when-let* ((data (gethash descriptor tramp-rpc--file-notify-descriptors)))
-    (let* ((watch-key (plist-get data :watch-key))
-           (entry (gethash watch-key tramp-rpc--file-notify-watch-counts))
-           (canonical-directory
-            (tramp-rpc--watch-entry-canonical-directory entry))
-           (count (and entry (plist-get entry :count))))
-      (cond
-       ((and count (> count 1))
-        (plist-put entry :count (1- count)))
-       (entry
-        (remhash watch-key tramp-rpc--file-notify-watch-counts)
-        (when (and (plist-get entry :owned)
-                   ;; If a Magit/cache watch has been installed for the same
-                   ;; key or canonical path while this file notification was
-                   ;; live, do not remove the server watch from underneath it.
-                   (not (tramp-rpc--canonical-watch-active-p
-                         canonical-directory)))
-          ;; Removing a file notification should not make
-          ;; `file-notify-rm-watch' fail if the remote connection has already
-          ;; gone away.
-          (condition-case err
-              (tramp-rpc-unwatch-directory (plist-get entry :directory))
-            (error
-             (tramp-rpc--debug "failed to remove file-notify watch %s: %s"
-                               (plist-get entry :directory)
-                               (error-message-string err))))))))
-    (remhash descriptor tramp-rpc--file-notify-descriptors)
-    (tramp-rpc--delete-file-notify-descriptor-process descriptor)))
-
-(defun tramp-rpc-handle-file-notify-valid-p (descriptor)
-  "Like `file-notify-valid-p' for TRAMP-RPC watch DESCRIPTOR."
-  (and (processp descriptor)
-       (process-live-p descriptor)
-       (gethash descriptor tramp-rpc--file-notify-descriptors)
-       t))
-
 ;; ============================================================================
 ;; File name handler registration
 ;; ============================================================================
@@ -3021,7 +2559,7 @@ FLAGS controls the requested operation."
     ;; =========================================================================
     (file-exists-p . tramp-rpc-handle-file-exists-p)
     (file-readable-p . tramp-rpc-handle-file-readable-p)
-    (file-writable-p . tramp-handle-file-writable-p)
+    (file-writable-p . tramp-rpc-handle-file-writable-p)
     (file-executable-p . tramp-rpc-handle-file-executable-p)
     (file-directory-p . tramp-rpc-handle-file-directory-p)
     (file-regular-p . tramp-rpc-handle-file-regular-p)
@@ -3078,7 +2616,8 @@ FLAGS controls the requested operation."
     (tramp-get-home-directory . tramp-rpc-handle-get-home-directory)
     (tramp-get-remote-uid . tramp-rpc-handle-get-remote-uid)
     (tramp-get-remote-gid . tramp-rpc-handle-get-remote-gid)
-    (tramp-get-remote-groups . tramp-rpc-handle-get-remote-groups)
+    ;; Kernel access checks do not need supplementary-group introspection.
+    (tramp-get-remote-groups . ignore)
     (exec-path . tramp-rpc-handle-exec-path)
     (list-system-processes . tramp-handle-list-system-processes)
     (process-attributes . tramp-handle-process-attributes)
@@ -3109,7 +2648,7 @@ FLAGS controls the requested operation."
     (access-file . tramp-rpc-handle-access-file)
     (directory-file-name . tramp-handle-directory-file-name)
     (dired-uncache . tramp-handle-dired-uncache)
-    (file-accessible-directory-p . tramp-handle-file-accessible-directory-p)
+    (file-accessible-directory-p . tramp-rpc-handle-file-accessible-directory-p)
     (file-equal-p . tramp-handle-file-equal-p)
     (file-in-directory-p . tramp-handle-file-in-directory-p)
     (file-name-as-directory . tramp-handle-file-name-as-directory)
@@ -3201,10 +2740,43 @@ VEC-OR-FILENAME can be either a tramp-file-name struct or a filename string."
 ;; Connection cleanup support
 ;; ============================================================================
 
-;; Internal transport teardown must always release file-notify watches.
-;; This is backend lifecycle wiring, not an opt-in editor integration.
-(add-hook 'tramp-rpc-transport-cleanup-functions
-          #'tramp-rpc--cleanup-file-notify-for-connection t)
+(defun tramp-rpc--connection-has-managed-processes-p (vec)
+  "Return non-nil when VEC owns a live managed pipe or PTY process."
+  (let ((key (tramp-rpc--connection-key vec))
+        found)
+    (dolist (table (list tramp-rpc--async-processes
+                         tramp-rpc--pty-processes))
+      (maphash
+       (lambda (process info)
+         (when (and (not found)
+                    (process-live-p process)
+                    (equal key
+                           (tramp-rpc--connection-key
+                            (plist-get info :vec))))
+           (setq found t)))
+       table))
+    found))
+
+(defun tramp-rpc--tramp-cleanup-connection-advice
+    (original vec &optional keep-debug keep-password keep-processes)
+  "Preserve VEC's multiplexed transport when KEEP-PROCESSES is non-nil.
+ORIGINAL is `tramp-cleanup-connection'.  KEEP-DEBUG and KEEP-PASSWORD retain
+their TRAMP meanings.  A managed RPC process depends on the shared server
+transport, so allowing generic cleanup to delete that transport would defeat
+KEEP-PROCESSES and terminate every managed child."
+  (if (and keep-processes
+           (tramp-rpc--managed-file-name-p vec)
+           (tramp-rpc--connection-has-managed-processes-p vec))
+      (progn
+        (unless keep-password
+          (tramp-clear-passwd vec))
+        ;; Invalidate file-derived state without flushing the connection
+        ;; properties that own the live multiplexed transport.
+        (tramp-flush-directory-properties vec "/")
+        (tramp-rpc--clear-direnv-cache vec)
+        (tramp-rpc--clear-file-caches-for-connection vec)
+        nil)
+    (funcall original vec keep-debug keep-password keep-processes)))
 
 (defun tramp-rpc-cleanup-connection (vec)
   "Clean up TRAMP-RPC resources for connection VEC.
@@ -3221,6 +2793,10 @@ responses, and RPC-specific caches (direnv, executable, file-exists,
     ;; processes, watches, connection hash, executable cache.
     ;; The redundant tramp-flush-* calls in disconnect are harmless.
     (tramp-rpc--disconnect vec)
+    ;; A direct SSH PTY can outlive an unexpectedly dead RPC generation and
+    ;; therefore may no longer be reachable through `tramp-rpc--disconnect'.
+    ;; Generic TRAMP cleanup is explicit ownership cleanup for those orphans.
+    (tramp-rpc--cleanup-pty-processes vec)
     ;; Clear RPC-specific caches for this connection.
     (tramp-rpc--clear-direnv-cache vec)
     (tramp-rpc--clear-file-caches-for-connection vec)
@@ -3254,6 +2830,8 @@ cleanup of all connections has run."
           (tramp-rpc--cleanup-controlmaster vec))))
     (clrhash tramp-rpc--watched-directories)
     (tramp-rpc--cleanup-file-notify-for-connection)
+    ;; Include direct SSH PTYs whose RPC generation died before global cleanup.
+    (tramp-rpc--cleanup-pty-processes)
     ;; Also kill orphaned auth buffers from failed connection attempts.
     (dolist (buf (buffer-list))
       (when (string-match-p "\\` \\*tramp-rpc-auth " (buffer-name buf))
@@ -3264,7 +2842,6 @@ cleanup of all connections has run."
     (clrhash tramp-rpc--connections)
     (clrhash tramp-rpc--connection-failures))
   ;; Clear all RPC-specific caches.
-  (tramp-rpc-protocol--clear-deferred-polls)
   (tramp-rpc--clear-direnv-cache)
   (tramp-rpc--clear-file-metadata-caches)
   ;; Note: recentf cleanup is handled by `tramp-recentf-cleanup-all'
@@ -3278,9 +2855,9 @@ cleanup of all connections has run."
 
 (defun tramp-rpc--after-load-integrations (_file)
   "Install integrations whose optional packages have just loaded."
-  (tramp-rpc-process-install-optional-handlers)
   (tramp-rpc-advice-install-optional-handlers)
-  (tramp-rpc-magit-install-optional-handlers))
+  (tramp-rpc-magit-install-optional-handlers)
+  (tramp-rpc-majutsu-install-optional-handlers))
 
 (defun tramp-rpc--unload-from-tramp ()
   "Unload tramp-rpc when TRAMP itself is unloaded."
@@ -3290,6 +2867,10 @@ cleanup of all connections has run."
 (defun tramp-rpc--install ()
   "Install TRAMP-RPC operations, advice, and lifecycle hooks."
   (tramp-rpc--install-core-external-operations)
+  (unless (advice-member-p #'tramp-rpc--tramp-cleanup-connection-advice
+                           'tramp-cleanup-connection)
+    (advice-add 'tramp-cleanup-connection :around
+                #'tramp-rpc--tramp-cleanup-connection-advice))
   (dolist (function '(tramp-get-connection-property
                       tramp-set-connection-property
                       tramp-flush-connection-property
@@ -3334,12 +2915,16 @@ Removes advice and cleans up async processes."
   (tramp-rpc--remove-external-operation 'move-file-to-trash 'tramp-rpc)
   ;; Unload helper modules explicitly.  Their standard feature unload
   ;; functions perform module-specific cleanup.
-  (dolist (feature '(tramp-rpc-advice tramp-rpc-magit tramp-rpc-cache
+  (dolist (feature '(tramp-rpc-advice tramp-rpc-magit tramp-rpc-majutsu
+                     tramp-rpc-notify
+                     tramp-rpc-cache
                      tramp-rpc-process tramp-rpc-transport tramp-rpc-deploy
                      tramp-rpc-hops tramp-rpc-connection tramp-rpc-protocol))
     (when (featurep feature)
       (unload-feature feature 'force)))
   ;; Remove multi-hop hook, property advice, and cleanup hooks.
+  (advice-remove 'tramp-cleanup-connection
+                 #'tramp-rpc--tramp-cleanup-connection-advice)
   (dolist (function '(tramp-get-connection-property
                       tramp-set-connection-property
                       tramp-flush-connection-property

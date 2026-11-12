@@ -77,7 +77,7 @@ straight/repos...."
   "Deployment settings for TRAMP-RPC."
   :group 'tramp)
 
-(defconst tramp-rpc-deploy-version "0.13.1"
+(defconst tramp-rpc-deploy-version "0.16.0"
   "Current version of tramp-rpc-server.")
 
 ;; Refer to .github/workflows/release.yml for supported architectures
@@ -215,28 +215,17 @@ only builds from source; release downloads are not used as a fallback."
           (const :tag "Build from source" build))
   :group 'tramp-rpc-deploy)
 
-(defvar tramp-rpc-deploy--allow-prompt nil
-  "Non-nil while deploying the target of an explicit installation.
-Only `tramp-rpc-deploy-ensure-binary' binds this, and only for the remote
-that `tramp-rpc-deploy-install-binary' was invoked for.")
+(cl-defstruct (tramp-rpc-deploy-plan
+               (:constructor tramp-rpc-deploy--make-plan))
+  "Resolved deployment policy and artifact identity for one target.
+Plans are constructed once and not mutated during acquisition or transfer."
+  target mode prompt force binary-id remote-localname source-hash
+  source-directory git-build-policy prefer-build)
 
-(defvar tramp-rpc-deploy--force-obtain nil
-  "Non-nil while the current deploy must replace existing artifacts.
-Scoped exactly like `tramp-rpc-deploy--allow-prompt'.")
-
-(defvar tramp-rpc-deploy--explicit-target nil
-  "Target key of the in-progress explicit installation, or nil.
-Explicit installation can block for a long time in `read-char-choice',
-downloads, or builds, during which timers may deploy to other remotes.
-Keying the request to one target keeps those reentrant deploys automatic.")
-
-(defvar tramp-rpc-deploy--explicit-force nil
-  "Non-nil when the in-progress explicit installation must replace artifacts.")
-
-(defvar tramp-rpc-deploy--pre-explicit-auto-deploy nil
-  "Value of `tramp-rpc-deploy-auto-deploy' before the explicit installation.
-Reentrant deploys for other remotes during an explicit installation use this
-value so the explicit auto-deploy override does not leak to them.")
+(defvar tramp-rpc-deploy--plan nil
+  "Deployment plan active for the current operation.
+Reentrant operations for another target resolve their own plan; they never
+inherit explicit permissions or change the user's customization variables.")
 
 (defun tramp-rpc-deploy--target-key (vec)
   "Return a comparable deployment target key for VEC."
@@ -248,11 +237,46 @@ value so the explicit auto-deploy override does not leak to them.")
             (tramp-file-name-hop vec))
     vec))
 
-(defun tramp-rpc-deploy--explicit-target-p (vec)
-  "Return non-nil when VEC is the target of the explicit installation."
-  (and tramp-rpc-deploy--explicit-target
-       (equal tramp-rpc-deploy--explicit-target
-              (tramp-rpc-deploy--target-key vec))))
+(defun tramp-rpc-deploy-plan (vec &optional explicit force)
+  "Resolve a deployment plan for VEC without acquiring or prompting.
+EXPLICIT permits interactive acquisition and transfer; FORCE requests a
+fresh artifact.  Connection-local settings are resolved before policy."
+  (let ((tramp-rpc-deploy--plan nil)
+        (default-directory (tramp-make-tramp-file-name vec "/")))
+    (with-connection-local-variables
+      (let* ((source (and (not tramp-rpc-deploy-never-deploy)
+                          (tramp-rpc-deploy--use-source-binary-id-p)))
+             (hash (and source (tramp-rpc-deploy--source-tree-hash)))
+             (id (unless tramp-rpc-deploy-never-deploy
+                   (or (and hash (tramp-rpc-deploy--source-binary-id hash))
+                       tramp-rpc-deploy-version))))
+        (tramp-rpc-deploy--make-plan
+         :target (tramp-rpc-deploy--target-key vec)
+         :mode (cond (tramp-rpc-deploy-never-deploy 'never)
+                     ((or explicit tramp-rpc-deploy-auto-deploy) 'auto)
+                     (t 'manual))
+         :prompt explicit :force (and explicit force)
+         :binary-id id :source-hash hash
+         :source-directory tramp-rpc-deploy-source-directory
+         :git-build-policy tramp-rpc-deploy-git-build-policy
+         :prefer-build tramp-rpc-deploy-prefer-build
+         :remote-localname
+         (if tramp-rpc-deploy-never-deploy
+             (or tramp-rpc-deploy-remote-binary-path tramp-rpc-deploy-binary-name)
+           (concat (file-name-as-directory tramp-rpc-deploy-remote-directory)
+                   (format "%s-%s" tramp-rpc-deploy-binary-name id))))))))
+
+(defun tramp-rpc-deploy--policy ()
+  "Return the resolved acquisition policy, or current policy outside a plan."
+  (if tramp-rpc-deploy--plan
+      (tramp-rpc-deploy-plan-git-build-policy tramp-rpc-deploy--plan)
+    tramp-rpc-deploy-git-build-policy))
+
+(defun tramp-rpc-deploy--prefer-build-p ()
+  "Return the resolved preference for building release-oriented artifacts."
+  (if tramp-rpc-deploy--plan
+      (tramp-rpc-deploy-plan-prefer-build tramp-rpc-deploy--plan)
+    tramp-rpc-deploy-prefer-build))
 
 (defcustom tramp-rpc-deploy-bootstrap-method "scpx"
   "TRAMP method to use for bootstrapping (deploying the binary).
@@ -452,8 +476,10 @@ Linux targets use musl for fully static binaries."
 
 (defun tramp-rpc-deploy--source-root ()
   "Return the configured source root as a directory name, or nil."
-  (when tramp-rpc-deploy-source-directory
-    (file-name-as-directory (expand-file-name tramp-rpc-deploy-source-directory))))
+  (when-let* ((directory (if tramp-rpc-deploy--plan
+                             (tramp-rpc-deploy-plan-source-directory tramp-rpc-deploy--plan)
+                           tramp-rpc-deploy-source-directory)))
+    (file-name-as-directory (expand-file-name directory))))
 
 (defun tramp-rpc-deploy--source-has-server-p (&optional source-root)
   "Return non-nil if SOURCE-ROOT has the Rust server sources.
@@ -464,9 +490,15 @@ When SOURCE-ROOT is nil, inspect `tramp-rpc-deploy-source-directory'."
          (file-directory-p (expand-file-name "server" root)))))
 
 (defun tramp-rpc-deploy--git-checkout-p ()
-  "Return non-nil if the source directory is inside a git checkout."
+  "Return non-nil if the source directory is inside a VCS checkout.
+Secondary Jujutsu workspaces have a .jj directory but no .git, and must
+still use source-keyed binaries instead of a stale release binary."
   (let ((root (tramp-rpc-deploy--source-root)))
-    (and root (locate-dominating-file root ".git"))))
+    (and root
+         (locate-dominating-file
+          root (lambda (dir)
+                 (or (file-exists-p (expand-file-name ".git" dir))
+                     (file-directory-p (expand-file-name ".jj" dir))))))))
 
 (defun tramp-rpc-deploy--source-file-list (&optional source-root)
   "Return files that affect the server build, relative to SOURCE-ROOT.
@@ -497,14 +529,19 @@ preserve timestamps."
   (let ((root (tramp-rpc-deploy--source-root))
         (files (tramp-rpc-deploy--source-file-list)))
     (when (and root files)
-      (with-temp-buffer
-        (set-buffer-multibyte nil)
-        (dolist (file files)
-          (insert (file-relative-name file root) "\0")
-          (let ((coding-system-for-read 'binary))
-            (insert-file-contents-literally file))
-          (insert "\0"))
-        (secure-hash 'sha256 (current-buffer))))))
+      ;; Temporary buffers inherit `default-directory'.  During connection
+      ;; setup that can be a remote RPC directory; coding detection may then
+      ;; expand an empty file name against it and recursively reconnect while
+      ;; the deployment binary id is still being computed.
+      (let ((default-directory (file-name-as-directory root)))
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (dolist (file files)
+            (insert (file-relative-name file root) "\0")
+            (let ((coding-system-for-read 'binary))
+              (insert-file-contents-literally file))
+            (insert "\0"))
+          (secure-hash 'sha256 (current-buffer)))))))
 
 (defun tramp-rpc-deploy--git-revision ()
   "Return the short git revision for the source checkout, or nil."
@@ -512,20 +549,23 @@ preserve timestamps."
     (when (and root
                (tramp-rpc-deploy--git-checkout-p)
                (executable-find "git"))
-      (with-temp-buffer
-        (if (zerop (call-process "git" nil t nil
-                                 "-C" root "rev-parse" "--short=12" "HEAD"))
-            (string-trim (buffer-string))
-          (tramp-rpc-deploy--log "git rev-parse failed: %s"
-                                 (string-trim (buffer-string)))
-          nil)))))
+      (let ((default-directory root))
+        (with-temp-buffer
+          (if (zerop (call-process "git" nil t nil
+                                   "-C" root "rev-parse" "--short=12" "HEAD"))
+              (string-trim (buffer-string))
+            (tramp-rpc-deploy--log "git rev-parse failed: %s"
+                                   (string-trim (buffer-string)))
+            nil))))))
 
 (defun tramp-rpc-deploy--use-source-binary-id-p ()
   "Return non-nil when binaries should be keyed by source content."
-  (and (memq tramp-rpc-deploy-git-build-policy '(auto build))
-       (tramp-rpc-deploy--source-has-server-p)
-       (tramp-rpc-deploy--git-checkout-p)
-       t))
+  (if tramp-rpc-deploy--plan
+      (not (null (tramp-rpc-deploy-plan-source-hash tramp-rpc-deploy--plan)))
+    (and (memq (tramp-rpc-deploy--policy) '(auto build))
+         (tramp-rpc-deploy--source-has-server-p)
+         (tramp-rpc-deploy--git-checkout-p)
+         t)))
 
 (defun tramp-rpc-deploy--source-directory-warning ()
   "Return a warning string for suspicious source-build auto-detection."
@@ -536,14 +576,14 @@ preserve timestamps."
             (abbreviate-file-name (tramp-rpc-deploy--source-root))
             tramp-rpc-deploy-version)))
 
-(defun tramp-rpc-deploy--source-binary-id ()
-  "Return a binary id derived from the current git checkout contents."
-  (let ((hash (tramp-rpc-deploy--source-tree-hash)))
+(defun tramp-rpc-deploy--source-binary-id (&optional source-hash)
+  "Return a binary id derived from SOURCE-HASH or the current checkout."
+  (let ((hash (or source-hash (tramp-rpc-deploy--source-tree-hash))))
     (when hash
       (format "git-%s-%s%s"
               (or (tramp-rpc-deploy--git-revision) "unknown")
               (substring hash 0 12)
-              (if (eq tramp-rpc-deploy-git-build-policy 'build)
+              (if (eq (tramp-rpc-deploy--policy) 'build)
                   "-build"
                 "")))))
 
@@ -552,9 +592,11 @@ preserve timestamps."
 Release installs use `tramp-rpc-deploy-version'.  Git checkouts use a
 source-tree keyed id so latest-git users do not reuse stale release
 artifacts when the Rust server changes without a version bump."
-  (or (and (tramp-rpc-deploy--use-source-binary-id-p)
-           (tramp-rpc-deploy--source-binary-id))
-      tramp-rpc-deploy-version))
+  (if tramp-rpc-deploy--plan
+      (tramp-rpc-deploy-plan-binary-id tramp-rpc-deploy--plan)
+    (or (and (tramp-rpc-deploy--use-source-binary-id-p)
+             (tramp-rpc-deploy--source-binary-id))
+        tramp-rpc-deploy-version)))
 
 (defun tramp-rpc-deploy--local-cache-path (arch)
   "Return the local cache path for binary of ARCH."
@@ -619,10 +661,7 @@ outputs whose mtime predates the source files."
    ;; Use concat instead of expand-file-name to preserve ~ for remote expansion.
    ;; expand-file-name would expand ~ to the LOCAL user's home directory,
    ;; causing failures when local and remote usernames differ.
-   (concat (file-name-as-directory tramp-rpc-deploy-remote-directory)
-           (format "%s-%s"
-                   tramp-rpc-deploy-binary-name
-                   (tramp-rpc-deploy--binary-id)))))
+   (tramp-rpc-deploy-expected-binary-localname)))
 
 ;; ============================================================================
 ;;; Download from GitHub Releases
@@ -919,7 +958,13 @@ returns or signals."
             (unless source-root
               (signal 'remote-file-error
                       (list "Release source archive has no usable Rust workspace")))
-            (let ((tramp-rpc-deploy-source-directory source-root))
+            (let ((tramp-rpc-deploy-source-directory source-root)
+                  (tramp-rpc-deploy--plan
+                   (and tramp-rpc-deploy--plan
+                        (copy-tramp-rpc-deploy-plan tramp-rpc-deploy--plan))))
+              (when tramp-rpc-deploy--plan
+                (setf (tramp-rpc-deploy-plan-source-directory tramp-rpc-deploy--plan)
+                      source-root))
               (funcall function))))
       (ignore-errors (delete-directory temp-dir t)))))
 
@@ -968,7 +1013,7 @@ deployment proceeds and lets Cargo report whether the platform is usable."
           (message "Building tramp-rpc-server for %s on %s using Rust toolchain %s"
                    arch location version)
           t)
-      (if tramp-rpc-deploy--allow-prompt
+      (if (and tramp-rpc-deploy--plan (tramp-rpc-deploy-plan-prompt tramp-rpc-deploy--plan))
           (if (y-or-n-p
                (format
                 "Platform %s might not be supported.  Build tramp-rpc-server on %s using Rust toolchain %s? "
@@ -998,7 +1043,10 @@ Returns the path to the binary on success, nil on failure."
            (tramp-rpc-deploy--detect-local-arch))))
 
   (let* ((toolchain (tramp-rpc-deploy--local-rust-toolchain-version))
-         (default-directory tramp-rpc-deploy-source-directory)
+         (default-directory (tramp-rpc-deploy--source-root))
+         (source-hash (or (and tramp-rpc-deploy--plan
+                               (tramp-rpc-deploy-plan-source-hash tramp-rpc-deploy--plan))
+                          (tramp-rpc-deploy--source-tree-hash)))
          (target (tramp-rpc-deploy--rust-target-for-arch arch))
          (cache-path (tramp-rpc-deploy--local-cache-path arch))
          (output-directory
@@ -1008,7 +1056,7 @@ Returns the path to the binary on success, nil on failure."
          (build-output (expand-file-name
                         (expand-file-name tramp-rpc-deploy-binary-name
                                           output-directory)
-                        tramp-rpc-deploy-source-directory))
+                        default-directory))
          (build-buffer (get-buffer-create "*tramp-rpc-build*")))
 
     (tramp-rpc-deploy--confirm-source-build arch toolchain "the local host")
@@ -1021,10 +1069,14 @@ Returns the path to the binary on success, nil on failure."
                          (when target (list "--target" target))
                          (list "--manifest-path"
                                (expand-file-name
-                                "Cargo.toml" tramp-rpc-deploy-source-directory))))
+                                "Cargo.toml" default-directory))))
            (exit-code (apply #'call-process "cargo" nil build-buffer nil args)))
       (if (zerop exit-code)
           (progn
+            ;; A resolved id fixes naming, not Cargo's inputs.  Refuse to
+            ;; publish a build if the source tree changed during acquisition.
+            (unless (equal source-hash (tramp-rpc-deploy--source-tree-hash))
+              (signal 'remote-file-error '("Server sources changed during build; retry deployment")))
             ;; Promote only a complete binary with its recorded digest.
             (tramp-rpc-deploy--promote-cached-binary
              build-output cache-path "source-build")
@@ -1032,8 +1084,8 @@ Returns the path to the binary on success, nil on failure."
             cache-path)
         (with-current-buffer build-buffer
           (signal
-	   'remote-file-error
-	   (list (format "Build failed (exit %d):\n%s" exit-code (buffer-string)))))))))
+           'remote-file-error
+           (list (format "Build failed (exit %d):\n%s" exit-code (buffer-string)))))))))
 
 (defun tramp-rpc-deploy--remote-path-prefix (vec)
   "Return a shell prefix exporting TRAMP's resolved remote PATH for VEC.
@@ -1395,8 +1447,8 @@ Return `download', `remote-build', or `skip'.  Return nil when the remote
 platform is unsupported, the source is unavailable, the remote toolchain is
 missing, or this is a noninteractive/reentrant deployment."
   (when (and (not noninteractive)
-             (or tramp-rpc-deploy--allow-prompt
-                 (not tramp-rpc-deploy--explicit-target))
+             (or (and tramp-rpc-deploy--plan (tramp-rpc-deploy-plan-prompt tramp-rpc-deploy--plan))
+                 (not tramp-rpc-deploy--plan))
              (tramp-rpc-deploy--platform-supported-p arch)
              (tramp-rpc-deploy--remote-source-build-available-p))
     (let ((toolchain (tramp-rpc-deploy--remote-rust-toolchain-version vec)))
@@ -1438,7 +1490,8 @@ missing, or this is a noninteractive/reentrant deployment."
 Return `download', `build', `remote-build', or nil.  A local build is offered
 when Cargo is available and ARCH can be built natively.  When VEC is supplied,
 a remote build is offered if the remote has a usable Rust toolchain."
-  (unless tramp-rpc-deploy--allow-prompt
+  (unless (and tramp-rpc-deploy--plan
+               (tramp-rpc-deploy-plan-prompt tramp-rpc-deploy--plan))
     (signal
      'remote-file-error
      (list
@@ -1500,10 +1553,10 @@ a remote build is offered if the remote has a usable Rust toolchain."
   "Return the methods to use for obtaining a missing binary for ARCH."
   (cond
    ((tramp-rpc-deploy--use-source-binary-id-p)
-    (list (if (eq tramp-rpc-deploy-git-build-policy 'build)
+    (list (if (eq (tramp-rpc-deploy--policy) 'build)
               'build
             (tramp-rpc-deploy--git-install-action arch))))
-   (tramp-rpc-deploy-prefer-build
+   ((tramp-rpc-deploy--prefer-build-p)
     '(build download))
    (t
     '(download build))))
@@ -1522,17 +1575,18 @@ Returns the path to the local binary."
   (let ((bundled-path (tramp-rpc-deploy--bundled-binary-path arch))
         (source-build-path
          (when (or (tramp-rpc-deploy--use-source-binary-id-p)
-                   tramp-rpc-deploy-prefer-build)
+                   (tramp-rpc-deploy--prefer-build-p))
            (tramp-rpc-deploy--source-build-output-path arch)))
-        (cache-path (tramp-rpc-deploy--local-cache-path arch)))
+        (cache-path (tramp-rpc-deploy--local-cache-path arch))
+        (force (and tramp-rpc-deploy--plan
+                    (tramp-rpc-deploy-plan-force tramp-rpc-deploy--plan))))
     (cond
      ;; Check bundled binaries first (useful for development - run
      ;; scripts/build-all.sh to populate lisp/binaries/).  In git-checkout
      ;; source-id mode, only trust a bundled binary when it is newer than the
      ;; source files; otherwise a stale bundled artifact can be deployed under
      ;; the fresh git hash and recreate the exact mismatch source-id mode avoids.
-     ((and (not tramp-rpc-deploy--force-obtain)
-           bundled-path
+     ((and (not force) bundled-path
            (or (not (tramp-rpc-deploy--use-source-binary-id-p))
                (tramp-rpc-deploy--newer-than-source-p bundled-path)))
       (message "Using bundled binary for %s" arch)
@@ -1540,12 +1594,12 @@ Returns the path to the local binary."
 
      ;; Check source-tree build output.  This supports CI jobs that download a
      ;; just-built server artifact into target/<triple>/release/.
-     ((and (not tramp-rpc-deploy--force-obtain) source-build-path)
+     ((and (not force) source-build-path)
       (message "Using source-tree build output for %s" arch)
       source-build-path)
 
      ;; Check cache
-     ((and (not tramp-rpc-deploy--force-obtain)
+     ((and (not force)
            (file-exists-p cache-path)
            (file-executable-p cache-path)
            (tramp-rpc-deploy--cached-binary-trusted-p cache-path))
@@ -1668,8 +1722,8 @@ SHA256 digest."
 
 (defun tramp-rpc-deploy--ensure-remote-directory (vec)
   "Ensure the remote deployment directory exists on VEC."
-  (let ((dir (tramp-file-local-name
-              (tramp-make-tramp-file-name vec tramp-rpc-deploy-remote-directory))))
+  (let ((dir (file-name-directory
+              (tramp-file-local-name (tramp-rpc-deploy--remote-binary-path vec)))))
     (tramp-send-command vec (format "mkdir -p %s" (tramp-shell-quote-argument dir)))))
 
 (defun tramp-rpc-deploy--compute-checksum (file)
@@ -1855,13 +1909,15 @@ to inline encoding (base64 through the shell), which can be fragile."
 This computes the path deterministically from customization variables,
 allowing `tramp-rpc--connect' to try connecting directly without
 opening a bootstrap (scpx) connection for the deploy check."
-  (concat (file-name-as-directory tramp-rpc-deploy-remote-directory)
-          (format "%s-%s"
-                  tramp-rpc-deploy-binary-name
-                  (tramp-rpc-deploy--binary-id))))
+  (if tramp-rpc-deploy--plan
+      (tramp-rpc-deploy-plan-remote-localname tramp-rpc-deploy--plan)
+    (concat (file-name-as-directory tramp-rpc-deploy-remote-directory)
+            (format "%s-%s" tramp-rpc-deploy-binary-name
+                    (tramp-rpc-deploy--binary-id)))))
 
-(defun tramp-rpc-deploy-ensure-binary (vec)
+(defun tramp-rpc-deploy-ensure-binary (vec &optional plan)
   "Ensure the tramp-rpc-server binary is available on remote VEC.
+PLAN, when supplied, must be VEC's resolved deployment plan.
 Returns the remote path (or bare binary name) to the binary.
 
 When `tramp-rpc-deploy-never-deploy' is non-nil, no deployment is
@@ -1876,154 +1932,149 @@ obtained (for example, download, build, or cache access is unavailable).
 When a trusted local artifact is available, its checksum is always compared:
 a mismatch is replaced only with auto-deploy enabled, and otherwise signals
 an explicit error.  A missing remote binary never uses this fallback."
-  (if tramp-rpc-deploy-never-deploy
-      ;; Never deploy mode: use explicit path or bare binary name
-      (let ((path (or tramp-rpc-deploy-remote-binary-path
-                      tramp-rpc-deploy-binary-name)))
-        (message "tramp-rpc: never-deploy mode, using %s on remote" path)
-        path)
-    ;; Normal deployment flow.  Prompting and forced replacement apply only to
-    ;; the remote an explicit installation was requested for; deploys that run
-    ;; reentrantly for other remotes stay fully automatic.
-    (let* ((explicit (tramp-rpc-deploy--explicit-target-p vec))
-           (tramp-rpc-deploy--allow-prompt explicit)
-           (tramp-rpc-deploy--force-obtain
-            (and explicit tramp-rpc-deploy--explicit-force))
-           (tramp-rpc-deploy-auto-deploy
-            (cond (explicit t)
-                  ;; Inside another remote's explicit installation window:
-                  ;; use the pre-override value so the explicit auto-deploy
-                  ;; override does not leak to unrelated remotes.
-                  (tramp-rpc-deploy--explicit-target
-                   tramp-rpc-deploy--pre-explicit-auto-deploy)
-                  (t tramp-rpc-deploy-auto-deploy)))
-           (bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec))
-	   ;; For simplified Tramp syntax.
-	   (tramp-default-method (tramp-file-name-method bootstrap-vec))
-	   tramp-default-method-alist)
-      (let* ((remote-present
-              (and (not tramp-rpc-deploy--force-obtain)
-                   (tramp-rpc-deploy--remote-binary-exists-p bootstrap-vec)))
-             (remote-local
-              (tramp-file-local-name
-               (tramp-rpc-deploy--remote-binary-path bootstrap-vec))))
-        (cond
-         ((and (not remote-present) (not tramp-rpc-deploy-auto-deploy))
-          (signal
-           'remote-file-error
-           (list "tramp-rpc-server not found on"
-                 (tramp-file-name-host vec)
-                 "and auto-deploy is disabled")))
-         (t
-          ;; The pre-existing remote executable is a usable fallback only when
-          ;; local artifact acquisition itself failed.  Once we have a trusted
-          ;; artifact, retain strict checksum comparison and replacement.
-          (let* ((arch (tramp-rpc-deploy--detect-remote-arch bootstrap-vec))
-                 ;; An explicit install is the one place where the user can
-                 ;; choose a remote source build before local artifact lookup.
-                 ;; Automatic deployment retains the existing local-first,
-                 ;; remote-fallback behavior below.
-                 (install-action
-                  (when (and explicit
-                             (tramp-rpc-deploy--use-source-binary-id-p)
-                             (eq tramp-rpc-deploy-git-build-policy 'auto))
-                    (tramp-rpc-deploy--git-install-action
-                     arch bootstrap-vec)))
-                 (artifact
-                  (if (eq install-action 'remote-build)
-                      (list :remote-binary
-                            (tramp-rpc-deploy--build-binary-on-remote-with-source-fallback
-                             bootstrap-vec arch))
-                    (condition-case local-error
-                        (list :local-binary
-                              (if install-action
-                                  (tramp-rpc-deploy--ensure-local-binary
-                                   arch install-action)
-                                (tramp-rpc-deploy--ensure-local-binary arch)))
-                      (remote-file-error
-                       ;; A remote native build is the fallback for unsupported
-                       ;; platforms and for hosts that cannot be cross-compiled
-                       ;; by the local toolchain.  An existing executable is
-                       ;; already a usable fallback, and remote building is
-                       ;; itself a deployment, so only try it for a missing
-                       ;; binary when auto-deploy is enabled.
-                       (if (and (not remote-present)
-                                tramp-rpc-deploy-auto-deploy
-                                (tramp-rpc-deploy--remote-source-build-available-p))
-                           (pcase (tramp-rpc-deploy--ask-remote-source-build-action
-                                   bootstrap-vec arch)
-                             ('download
-                              (condition-case download-error
-                                  (list :local-binary
-                                        (tramp-rpc-deploy--ensure-local-binary
-                                         arch 'download))
-                                (remote-file-error
-                                 (signal
-                                  'remote-file-error
-                                  (list
-                                   (format
-                                    "Local artifact and release download failed for %s.\n\nLocal error: %s\n\nDownload error: %s"
-                                    arch
-                                    (error-message-string local-error)
-                                    (error-message-string download-error)))))))
-                             ('skip
-                              (signal
-                               'remote-file-error
-                               (list
-                                (format
-                                 "Deployment skipped for %s.\n\nLocal artifact error: %s"
-                                 arch
-                                 (error-message-string local-error)))))
-                             (_
-                              (message
-                               "No usable local artifact for %s; trying a native source build on %s"
-                               arch (tramp-file-name-host bootstrap-vec))
-                              (condition-case remote-error
-                                  (list :remote-binary
-                                        (tramp-rpc-deploy--build-binary-on-remote-with-source-fallback
-                                         bootstrap-vec arch))
-                                (remote-file-error
-                                 (if remote-present
-                                     (list :unavailable local-error)
+  (let* ((target (tramp-rpc-deploy--target-key vec))
+         (tramp-rpc-deploy--plan
+          (or plan
+              (and tramp-rpc-deploy--plan
+                   (equal target (tramp-rpc-deploy-plan-target tramp-rpc-deploy--plan))
+                   tramp-rpc-deploy--plan)
+              (tramp-rpc-deploy-plan vec)))
+         (mode (tramp-rpc-deploy-plan-mode tramp-rpc-deploy--plan)))
+    (unless (equal target (tramp-rpc-deploy-plan-target tramp-rpc-deploy--plan))
+      (error "Deployment plan belongs to a different target"))
+    (if (eq mode 'never)
+        (let ((path (tramp-rpc-deploy-plan-remote-localname tramp-rpc-deploy--plan)))
+          (message "tramp-rpc: never-deploy mode, using %s on remote" path)
+          path)
+      ;; Permissions belong to the plan, not dynamically overridden defcustoms.
+      (let* ((bootstrap-vec (tramp-rpc-deploy--bootstrap-vec vec))
+             ;; For simplified Tramp syntax.
+             (tramp-default-method (tramp-file-name-method bootstrap-vec))
+             tramp-default-method-alist)
+        (let* ((remote-present
+                (and (not (tramp-rpc-deploy-plan-force tramp-rpc-deploy--plan))
+                     (tramp-rpc-deploy--remote-binary-exists-p bootstrap-vec)))
+               (remote-local
+                (tramp-file-local-name
+                 (tramp-rpc-deploy--remote-binary-path bootstrap-vec))))
+          (cond
+           ((and (not remote-present) (eq mode 'manual))
+            (signal
+             'remote-file-error
+             (list "tramp-rpc-server not found on"
+                   (tramp-file-name-host vec)
+                   "and auto-deploy is disabled")))
+           (t
+            ;; The pre-existing remote executable is a usable fallback only when
+            ;; local artifact acquisition itself failed.  Once we have a trusted
+            ;; artifact, retain strict checksum comparison and replacement.
+            (let* ((arch (tramp-rpc-deploy--detect-remote-arch bootstrap-vec))
+                   ;; An explicit install is the one place where the user can
+                   ;; choose a remote source build before local artifact lookup.
+                   ;; Automatic deployment retains the existing local-first,
+                   ;; remote-fallback behavior below.
+                   (install-action
+                    (when (and (tramp-rpc-deploy-plan-prompt tramp-rpc-deploy--plan)
+                               (tramp-rpc-deploy--use-source-binary-id-p)
+                               (eq (tramp-rpc-deploy--policy) 'auto))
+                      (tramp-rpc-deploy--git-install-action
+                       arch bootstrap-vec)))
+                   (artifact
+                    (if (eq install-action 'remote-build)
+			(list :remote-binary
+                              (tramp-rpc-deploy--build-binary-on-remote-with-source-fallback
+                               bootstrap-vec arch))
+                      (condition-case local-error
+                          (list :local-binary
+				(if install-action
+                                    (tramp-rpc-deploy--ensure-local-binary
+                                     arch install-action)
+                                  (tramp-rpc-deploy--ensure-local-binary arch)))
+			(remote-file-error
+			 ;; A remote native build is the fallback for unsupported
+			 ;; platforms and for hosts that cannot be cross-compiled
+			 ;; by the local toolchain.  An existing executable is
+			 ;; already a usable fallback, and remote building is
+			 ;; itself a deployment, so only try it for a missing
+			 ;; binary when auto-deploy is enabled.
+			 (if (and (not remote-present)
+                                  (eq mode 'auto)
+                                  (tramp-rpc-deploy--remote-source-build-available-p))
+                             (pcase (tramp-rpc-deploy--ask-remote-source-build-action
+                                     bootstrap-vec arch)
+                               ('download
+				(condition-case download-error
+                                    (list :local-binary
+                                          (tramp-rpc-deploy--ensure-local-binary
+                                           arch 'download))
+                                  (remote-file-error
                                    (signal
                                     'remote-file-error
                                     (list
                                      (format
-                                      "Local artifact and remote source build failed for %s.\n\nLocal error: %s\n\nRemote error: %s"
+                                      "Local artifact and release download failed for %s.\n\nLocal error: %s\n\nDownload error: %s"
                                       arch
                                       (error-message-string local-error)
-                                      (error-message-string remote-error)))))))))
-                         (if remote-present
-                             (list :unavailable local-error)
-                           (signal (car local-error) (cdr local-error))))))))
-                 (local-binary (plist-get artifact :local-binary))
-                 (remote-binary (plist-get artifact :remote-binary)))
-            (cond
-             ((eq (car artifact) :unavailable)
-              (message
-               "Using existing remote tramp-rpc-server; no trusted local artifact is available: %s"
-               (error-message-string (cadr artifact)))
-              remote-local)
-             (remote-binary
-              (message "Using remotely built tramp-rpc-server for %s" arch)
-              remote-local)
-             ((and remote-present
-                   (tramp-rpc-deploy--remote-binary-matches-p
-                    bootstrap-vec local-binary))
-              remote-local)
-             (tramp-rpc-deploy-auto-deploy
-              (when remote-present
-                (message "Existing remote tramp-rpc-server failed checksum verification; replacing it"))
-              (message "Deploying tramp-rpc-server (%s) to %s..."
-                       arch (tramp-file-name-host vec))
-              (tramp-file-local-name
-               (tramp-rpc-deploy--transfer-binary bootstrap-vec local-binary)))
-             (remote-present
-              (signal
-               'remote-file-error
-               (list "Existing tramp-rpc-server on"
-                     (tramp-file-name-host vec)
-                     "failed checksum verification and auto-deploy is disabled")))))))))))
+                                      (error-message-string download-error)))))))
+                               ('skip
+				(signal
+				 'remote-file-error
+				 (list
+                                  (format
+                                   "Deployment skipped for %s.\n\nLocal artifact error: %s"
+                                   arch
+                                   (error-message-string local-error)))))
+                               (_
+				(message
+				 "No usable local artifact for %s; trying a native source build on %s"
+				 arch (tramp-file-name-host bootstrap-vec))
+				(condition-case remote-error
+                                    (list :remote-binary
+                                          (tramp-rpc-deploy--build-binary-on-remote-with-source-fallback
+                                           bootstrap-vec arch))
+                                  (remote-file-error
+                                   (if remote-present
+                                       (list :unavailable local-error)
+                                     (signal
+                                      'remote-file-error
+                                      (list
+                                       (format
+					"Local artifact and remote source build failed for %s.\n\nLocal error: %s\n\nRemote error: %s"
+					arch
+					(error-message-string local-error)
+					(error-message-string remote-error)))))))))
+                           (if remote-present
+                               (list :unavailable local-error)
+                             (signal (car local-error) (cdr local-error))))))))
+                   (local-binary (plist-get artifact :local-binary))
+                   (remote-binary (plist-get artifact :remote-binary)))
+              (cond
+               ((eq (car artifact) :unavailable)
+		(message
+		 "Using existing remote tramp-rpc-server; no trusted local artifact is available: %s"
+		 (error-message-string (cadr artifact)))
+		remote-local)
+               (remote-binary
+		(message "Using remotely built tramp-rpc-server for %s" arch)
+		remote-local)
+               ((and remote-present
+                     (tramp-rpc-deploy--remote-binary-matches-p
+                      bootstrap-vec local-binary))
+		remote-local)
+               ((eq mode 'auto)
+		(when remote-present
+                  (message "Existing remote tramp-rpc-server failed checksum verification; replacing it"))
+		(message "Deploying tramp-rpc-server (%s) to %s..."
+			 arch (tramp-file-name-host vec))
+		(tramp-file-local-name
+		 (tramp-rpc-deploy--transfer-binary bootstrap-vec local-binary)))
+               (remote-present
+		(signal
+		 'remote-file-error
+		 (list "Existing tramp-rpc-server on"
+                       (tramp-file-name-host vec)
+                       "failed checksum verification and auto-deploy is disabled")))))))))))
+  )
 
 ;;;###autoload
 (defun tramp-rpc-deploy-install-binary (vec &optional force)
@@ -2038,20 +2089,19 @@ ask again in `auto' mode.  Explicit installation overrides
 `tramp-rpc-deploy-never-deploy' is non-nil."
   (interactive
    (list (tramp-dissect-file-name
-          (read-file-name "Remote TRAMP-RPC host: " "/rpc:"))
+          ;; Keep the local directory out of the input and start typing
+          ;; after the method prefix, without losing TRAMP completion.
+          (let ((insert-default-directory nil))
+            (minibuffer-with-setup-hook
+                (lambda () (goto-char (point-max)))
+              (read-file-name "Remote TRAMP-RPC host: " nil nil nil "/rpc:"))))
          current-prefix-arg))
-  (when tramp-rpc-deploy-never-deploy
-    (user-error "Deployment is disabled by `tramp-rpc-deploy-never-deploy'"))
-  ;; An explicit installation is the user's request to try again now, even if
-  ;; a preceding completion probe cached a failed connection attempt.  Keep
-  ;; this optional so the autoloaded deployment module remains usable before
-  ;; the main tramp-rpc module has been loaded.
-  (when (fboundp 'tramp-rpc--clear-connection-failure)
-    (tramp-rpc--clear-connection-failure vec))
-  (let ((tramp-rpc-deploy--explicit-target (tramp-rpc-deploy--target-key vec))
-        (tramp-rpc-deploy--explicit-force force)
-        (tramp-rpc-deploy--pre-explicit-auto-deploy tramp-rpc-deploy-auto-deploy))
-    (tramp-rpc-deploy-ensure-binary vec)))
+  (let ((plan (tramp-rpc-deploy-plan vec t force)))
+    (when (eq (tramp-rpc-deploy-plan-mode plan) 'never)
+      (user-error "Deployment is disabled by `tramp-rpc-deploy-never-deploy'"))
+    (when (fboundp 'tramp-rpc--clear-connection-failure)
+      (tramp-rpc--clear-connection-failure vec))
+    (tramp-rpc-deploy-ensure-binary vec plan)))
 
 (defun tramp-rpc-deploy-remove-binary (vec)
   "Remove the tramp-rpc-server binary from remote VEC."

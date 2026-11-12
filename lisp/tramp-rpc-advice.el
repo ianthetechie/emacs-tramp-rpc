@@ -15,13 +15,15 @@
 
 ;;; Commentary:
 
-;; This file provides all the own Tramp handlers that tramp-rpc
+;; This file provides the advice and Tramp handlers that tramp-rpc
 ;; installs on Emacs built-in process functions:
 ;; - process-send-string / process-send-region (route to remote stdin)
 ;; - process-send-eof (close remote stdin or send Ctrl-D to PTY)
 ;; - signal-process (forward signals to remote PID)
+;; - interrupt-process (interrupt the remote process, not its local relay)
 ;; - process-status / process-exit-status (return remote process state)
 ;; - process-command / process-tty-name (return stored metadata)
+;; - set-process-sentinel / process-sentinel (keep tramp-rpc's own sentinel)
 ;; - vc-call-backend (ensure default-directory for remote VC files)
 ;; - vc-exec-after (handle native-compiled VC process state races)
 ;; - python-shell--tramp-with-environment (avoid sending shell commands to the RPC server)
@@ -41,6 +43,7 @@
 
 ;; Functions from tramp-rpc.el
 (declare-function tramp-rpc-file-name-p "tramp-rpc")
+(declare-function tramp-rpc--forget-managed-process "tramp-rpc-process" (process))
 
 ;; Variables from tramp-rpc.el / tramp-rpc-process.el
 
@@ -94,112 +97,91 @@ PROCESS is the process being handled."
       (funcall orig-fun process)))
 
 ;; ============================================================================
-;; Process I/O handler
+;; Process routing
 ;; ============================================================================
+
+;; Process primitives are routed by process ownership in outermost advice,
+;; not through Tramp's file name handlers.  Ownership is a property of the
+;; process object, and handler dispatch would run the native primitive under
+;; `tramp-run-real-handler', whose inhibition leaks into filters and timers
+;; run while a blocked write waits.  Internal relay plumbing bypasses the
+;; advice per call with `tramp-rpc--native-call'.
 
 (defun tramp-rpc--resolve-process (process)
   "Return the process object denoted by PROCESS, or nil."
   (cond
    ((processp process) process)
+   ((null process) (get-buffer-process (current-buffer)))
    ((bufferp process) (get-buffer-process process))
    ((stringp process)
-    (when-let* ((buffer (get-buffer process)))
-      (get-buffer-process buffer)))))
+    (or (get-process process)
+        (when-let* ((buffer (get-buffer process)))
+          (get-buffer-process buffer))))))
 
-(defun tramp-rpc--send-managed-process-string (process string operation)
-  "Send STRING to RPC-managed PROCESS for OPERATION.
-Return `not-managed' when PROCESS must use the native handler."
-  (let ((proc (tramp-rpc--managed-send-process process)))
-    (cond
-     ((not proc) 'not-managed)
-     ((process-get proc :tramp-rpc-pty)
-      (let ((vec (process-get proc :tramp-rpc-vec))
-            (pid (process-get proc :tramp-rpc-pid)))
-        (tramp-rpc--debug "%s PTY pid=%s len=%d" operation pid (length string))
-        (tramp-rpc--call
-         vec "process.write_pty"
-         `((pid . ,pid)
-           (data . ,(msgpack-bin-make
-                     (tramp-rpc--encode-process-input proc string))))
-         (process-get proc :tramp-rpc-connection))
-        nil))
-     (t
-      (let ((vec (process-get proc :tramp-rpc-vec))
-            (pid (process-get proc :tramp-rpc-pid)))
-        (tramp-rpc--debug "%s pipe pid=%s len=%d" operation pid (length string))
-        (tramp-rpc--write-remote-process
-         vec pid (tramp-rpc--encode-process-input proc string) proc)
-        (when tramp-rpc-synchronous-pipe-writes
-          (tramp-rpc--drain-write-queue vec pid proc)))))))
+(defun tramp-rpc--send-managed-process-string (proc string operation)
+  "Send STRING to the remote stdin of RPC-managed PROC for OPERATION."
+  (let ((vec (process-get proc :tramp-rpc-vec))
+        (pid (process-get proc :tramp-rpc-pid))
+        (data (tramp-rpc--encode-process-input proc string)))
+    (if (process-get proc :tramp-rpc-pty)
+        (progn
+          (tramp-rpc--debug "%s PTY pid=%s len=%d" operation pid (length string))
+          (tramp-rpc--call vec "process.write_pty"
+                           `((pid . ,pid) (data . ,(msgpack-bin-make data)))
+                           (process-get proc :tramp-rpc-connection)))
+      (tramp-rpc--debug "%s pipe pid=%s len=%d" operation pid (length string))
+      (tramp-rpc--write-remote-process vec pid data proc)
+      (when tramp-rpc-synchronous-pipe-writes
+        (tramp-rpc--drain-write-queue vec pid proc))))
+  nil)
 
 (defun tramp-rpc--managed-send-process (process)
   "Return PROCESS's RPC-managed process, or nil when native delivery is needed."
   (when-let* ((proc (tramp-rpc--resolve-process process)))
-    (and (not tramp-rpc--delivering-output)
-         (not (process-get proc :tramp-rpc-direct-ssh))
+    (and (not (process-get proc :tramp-rpc-direct-ssh))
          (process-get proc :tramp-rpc-pid)
          (process-get proc :tramp-rpc-vec)
          proc)))
 
-(defun tramp-rpc-handle-process-send-string (process string)
-  "Send STRING to the TRAMP-RPC PROCESS."
-  (when (eq (tramp-rpc--send-managed-process-string
-             process string "SEND-STRING")
-            'not-managed)
-    (tramp-run-real-handler #'process-send-string (list process string))))
+(defun tramp-rpc--process-send-string-advice (orig-fun process string)
+  "Send STRING to RPC-managed PROCESS, otherwise call ORIG-FUN."
+  (if-let* ((proc (tramp-rpc--managed-send-process process)))
+      (tramp-rpc--send-managed-process-string proc string "SEND-STRING")
+    (funcall orig-fun process string)))
 
-(defun tramp-rpc-handle-process-send-region (process start end)
-  "Handler for `process-send-region' for TRAMP-RPC processes.
-PROCESS is the process being handled.
-START and END are buffer positions delimiting the text to send."
+(defun tramp-rpc--process-send-region-advice (orig-fun process start end)
+  "Send region START to END to RPC-managed PROCESS, otherwise call ORIG-FUN."
   (if-let* ((proc (tramp-rpc--managed-send-process process)))
       (tramp-rpc--send-managed-process-string
        proc (buffer-substring-no-properties start end) "SEND-REGION")
-    ;; Preserve native region delivery for bypasses and non-RPC processes.
-    (tramp-run-real-handler #'process-send-region
-                            (list process start end))))
+    (funcall orig-fun process start end)))
 
-(defun tramp-rpc-handle-process-send-eof (&optional process)
-  "Handler for `process-send-eof' for TRAMP-RPC processes.
-PROCESS is the process being handled."
-  ;; When closing a local cat relay, bypass this handler entirely so
-  ;; the EOF reaches the local process rather than the remote one.
-  (if tramp-rpc--closing-local-relay
-      (tramp-run-real-handler #'process-send-eof (and process (list process)))
-    (let ((proc (or process (get-buffer-process (current-buffer)))))
-      (cond
-       ;; Direct SSH PTY - use normal process-send-eof
-       ((and proc (process-get proc :tramp-rpc-direct-ssh))
-         (tramp-run-real-handler #'process-send-eof (and process (list process))))
-       ;; RPC-managed process
-       ((and proc
-             (process-get proc :tramp-rpc-pid)
-             (process-get proc :tramp-rpc-vec))
-        (let ((pid (process-get proc :tramp-rpc-pid))
-              (vec (process-get proc :tramp-rpc-vec)))
-          ;; Only try to send EOF if the process hasn't already exited.
-          ;; Short-lived processes (like git apply) may exit before we call
-          ;; process-send-eof, which is fine - stdin was already closed on exit.
-          (unless (or (process-get proc :tramp-rpc-exited)
-                      (not (process-live-p proc)))
-            (if (process-get proc :tramp-rpc-pty)
-                ;; PTY processes: send Ctrl-D (EOF character) via the PTY.
-                (let ((eof-char (string ?\C-d))) ; ASCII 4 = Ctrl-D
-                  (tramp-rpc--call vec "process.write_pty"
-                                   `((pid . ,pid)
-                                     (data . ,(msgpack-bin-make eof-char)))
-                                   (process-get proc :tramp-rpc-connection)))
-              ;; Pipe processes: a queue failure must reach the caller.
-              (tramp-rpc--close-remote-stdin vec pid proc)))))
-       ;; Not a tramp-rpc process
-       (t (tramp-run-real-handler #'process-send-eof (and process (list process))))))))
+(defun tramp-rpc--process-send-eof-advice (orig-fun &optional process)
+  "Close the remote stdin of RPC-managed PROCESS, otherwise call ORIG-FUN."
+  (if-let* ((proc (tramp-rpc--managed-send-process process)))
+      (let ((pid (process-get proc :tramp-rpc-pid))
+            (vec (process-get proc :tramp-rpc-vec)))
+        ;; Short-lived processes (like git apply) may exit before the caller
+        ;; sends EOF, which is fine: stdin was already closed on exit.
+        (unless (or (process-get proc :tramp-rpc-exited)
+                    (not (process-live-p proc)))
+          (if (process-get proc :tramp-rpc-pty)
+              ;; PTY processes: send Ctrl-D (EOF character) via the PTY.
+              (tramp-rpc--call vec "process.write_pty"
+                               `((pid . ,pid)
+                                 (data . ,(msgpack-bin-make (string ?\C-d))))
+                               (process-get proc :tramp-rpc-connection))
+            ;; Pipe processes: a queue failure must reach the caller.
+            (tramp-rpc--close-remote-stdin vec pid proc))))
+    (apply orig-fun (and process (list process)))))
 
-(defun tramp-rpc-handle-signal-process (process sigcode &optional remote)
+(defun tramp-rpc-handle-signal-process (process sigcode &optional remote current-group)
   "Handler for `signal-process' of TRAMP-RPC processes.
 It will be added to `signal-process-functions'.
 PROCESS is the process object or remote PID being handled.
 SIGCODE identifies the signal to send.  REMOTE identifies the host when
-PROCESS is a PID."
+PROCESS is a PID.  CURRENT-GROUP selects an RPC PTY's foreground job;
+`lambda' skips the signal when the terminal's leader owns the foreground."
   (when (stringp process)
     (setq process
           (or (get-process process)
@@ -230,7 +212,11 @@ PROCESS is a PID."
                ;; Use PTY kill for PTY processes, regular kill for pipes.
                ((process-get rpc-process :tramp-rpc-pty)
                 (tramp-rpc--call vec "process.kill_pty"
-                                 `((pid . ,pid) (signal . ,sigcode))
+                                 (append `((pid . ,pid) (signal . ,sigcode))
+                                         (when current-group
+                                           `((group . ,(if (eq current-group 'lambda)
+                                                           "foreground_unless_leader"
+                                                         "foreground")))))
                                  connection))
                (t
                 (tramp-rpc--kill-remote-process
@@ -240,141 +226,165 @@ PROCESS is a PID."
            (message "tramp-rpc: Error signaling process: %s" err)
            -1))))))
 
+(defun tramp-rpc-handle-interrupt-process (&optional process current-group)
+  "Interrupt TRAMP-RPC PROCESS remotely, for `interrupt-process-functions'.
+The default would signal the local relay, which ends it and, through its
+sentinel, kills the remote process instead of interrupting it.  A direct SSH
+PTY gets the interrupt character, like a terminal.  PROCESS can be a
+process, a buffer, a process or buffer name, or nil for the current buffer.
+CURRENT-GROUP selects the foreground job for RPC PTYs, as in
+`interrupt-process'.  Return nil for other processes."
+  (when-let* ((proc (tramp-rpc--resolve-process process))
+              ((or (process-get proc :tramp-rpc-direct-ssh)
+                   (process-get proc :tramp-rpc-pid))))
+    (unless (process-live-p proc)
+      (error "Process %s is not active" (process-name proc)))
+    (if (process-get proc :tramp-rpc-direct-ssh)
+        (process-send-string proc (string ?\C-c))
+      (unless (eq 0 (tramp-rpc-handle-signal-process proc 2 nil current-group))
+        (signal 'remote-file-error '("Failed to interrupt remote process"))))
+    t))
+
 ;; ============================================================================
-;; Process metadata handlers
+;; Process metadata
 ;; ============================================================================
 
-(defun tramp-rpc-handle-process-status (process)
-  "Handler for `process-status' for TRAMP-RPC processes.
-PROCESS is the process being handled."
-  (if (and (processp process) (process-get process :tramp-rpc-pid))
+(defun tramp-rpc--process-status-advice (orig-fun process)
+  "Return the remote status of RPC-managed PROCESS, otherwise call ORIG-FUN."
+  ;; Unlike other process primitives, a string names only a process here.
+  (if-let* ((proc (if (stringp process)
+                      (get-process process)
+                    (tramp-rpc--resolve-process process)))
+            ((process-get proc :tramp-rpc-pid)))
       (cond
-       ((process-get process :tramp-rpc-exited) 'exit)
-       ;; Use the real handler to check local relay liveness, not
-       ;; `process-live-p' (which would recurse).  Do not perform synchronous
-       ;; remote status RPCs here: callers such as mode-line redisplay,
-       ;; Flymake, and LSP process management may ask for process status while
-       ;; the user is typing.
-       ((memq (tramp-run-real-handler #'process-status (list process))
-	      '(run open listen connect))
-	'run)
+       ;; Check local relay liveness with ORIG-FUN.  Do not perform
+       ;; synchronous remote status RPCs here: callers such as mode-line
+       ;; redisplay, Flymake, and LSP process management may ask for process
+       ;; status while the user is typing.  The relay stays live until the
+       ;; remote output has been delivered, so the remote exit status only
+       ;; applies after that.
+       ((and (not (process-get proc :tramp-rpc-exited))
+             (memq (funcall orig-fun proc) '(run open listen connect)))
+        'run)
+       ;; A remote signal death is reported as `signal', matching local
+       ;; processes.  Callers such as LSP and compile branch on this.
+       ((integerp (process-get proc :tramp-rpc-exit-signal)) 'signal)
        (t 'exit))
-    (tramp-run-real-handler #'process-status (list process))))
+    (funcall orig-fun process)))
 
-(defun tramp-rpc-handle-process-exit-status (process)
-  "Handler for `process-exit-status' for TRAMP-RPC processes.
-PROCESS is the process being handled."
+(defun tramp-rpc--process-exit-status-advice (orig-fun process)
+  "Return the remote exit status of RPC-managed PROCESS.
+Signal deaths report the signal number, like local processes.  Call
+ORIG-FUN for other processes."
   (if (and (processp process) (process-get process :tramp-rpc-pid))
-      (or (process-get process :tramp-rpc-exit-code) 0)
-    (tramp-run-real-handler #'process-exit-status (list process))))
+      (or (process-get process :tramp-rpc-exit-signal)
+          (process-get process :tramp-rpc-exit-code)
+          0)
+    (funcall orig-fun process)))
 
-(defun tramp-rpc-handle-process-command (process)
-  "Handler for `process-command' to return stored command for PTY processes.
-PROCESS is the process being handled."
-  (if (and (processp process) (process-get process :tramp-rpc-command))
-      (process-get process :tramp-rpc-command)
-    (tramp-run-real-handler #'process-command (list process))))
+(defun tramp-rpc--process-command-advice (orig-fun process)
+  "Return the remote command of RPC PROCESS, otherwise call ORIG-FUN."
+  (or (and (processp process) (process-get process :tramp-rpc-command))
+      (funcall orig-fun process)))
 
-(defun tramp-rpc-handle-process-tty-name (process &optional stream)
-  "Handler for `process-tty-name' to return stored TTY name for PTY processes.
-For TRAMP-RPC PTY processes, return the remote TTY name stored during creation.
-For direct SSH PTY processes, use the original function (returns local PTY).
-PROCESS is the process being handled.
-STREAM is the output stream being handled."
+(defun tramp-rpc--process-tty-name-advice (orig-fun process &optional stream)
+  "Return the remote TTY name of RPC PTY PROCESS, otherwise call ORIG-FUN.
+Direct SSH PTYs use their local PTY name.  STREAM is passed to ORIG-FUN."
   (if (and (processp process)
            (process-get process :tramp-rpc-pty)
            (not (process-get process :tramp-rpc-direct-ssh)))
       (process-get process :tramp-rpc-tty-name)
-    (tramp-run-real-handler #'process-tty-name (list process stream))))
+    (funcall orig-fun process stream)))
+
+(defun tramp-rpc--set-process-sentinel-advice (orig-fun process sentinel)
+  "Store SENTINEL as the caller's sentinel of RPC PROCESS.
+Replacing tramp-rpc's own sentinel would lose the remote exit status and the
+remote cleanup, so its own sentinel calls SENTINEL instead.  Call ORIG-FUN
+for other processes."
+  (if (and (processp process) (process-get process :tramp-rpc-own-sentinel))
+      (progn
+        (process-put process :tramp-rpc-user-sentinel sentinel)
+        sentinel)
+    (funcall orig-fun process sentinel)))
+
+(defun tramp-rpc--process-sentinel-advice (orig-fun process)
+  "Return the caller's sentinel of RPC PROCESS, otherwise call ORIG-FUN.
+Return `ignore' when there is none: tramp-rpc never runs the default
+sentinel."
+  (if (and (processp process) (process-get process :tramp-rpc-own-sentinel))
+      (or (process-get process :tramp-rpc-user-sentinel) #'ignore)
+    (funcall orig-fun process)))
 
 ;; ============================================================================
 ;; VC integration handler
 ;; ============================================================================
 
 ;; VC backends like vc-git-state use process-file internally, but they don't
-;; set default-directory to the remote file's directory. This means process-file
-;; runs locally instead of going through our tramp handler. We fix this by
-;; advising vc-call-backend to set default-directory when the file is remote.
+;; set default-directory to the remote file's directory.  This means
+;; process-file runs locally instead of going through our tramp handler.  We
+;; fix this by advising vc-call-backend to set default-directory when the
+;; file is remote.
 
-(defun tramp-rpc--vc-call-backend-file-name-for-operation
-    (_operation _backend function-name &rest args)
-  "Helper function for `vc-call-backend' handler.
-FUNCTION-NAME names the function being checked.
-ARGS contains the original function arguments."
-  (or (and ;; Operations that take a file and may call process-file
-           (memq function-name '(registered state state-heuristic dir-status-files
-                                 working-revision previous-revision next-revision
-                                 responsible-p))
-	   (stringp (car args)) (car args))
-      ""))
+(defconst tramp-rpc--vc-file-operations
+  '(registered state state-heuristic dir-status-files working-revision
+    previous-revision next-revision responsible-p)
+  "VC backend operations that take a file and may call `process-file'.")
 
-(defun tramp-rpc-handle-vc-call-backend (backend function-name &rest args)
-  "Handler for `vc-call-backend' for TRAMP files correctly.
-When FUNCTION-NAME is an operation that takes a file argument and that file is
-a TRAMP path, ensure `default-directory' is set to the file's directory so that
-`process-file' calls are routed through the TRAMP handler.
-BACKEND is the VC backend."
-  (let ((default-directory (file-name-directory (car args))))
-    (tramp-run-real-handler
-     #'vc-call-backend (append `(,backend ,function-name) args))))
+(defun tramp-rpc--vc-call-backend-advice (orig-fun backend function-name
+                                                   &rest args)
+  "Run VC FUNCTION-NAME for a TRAMP-RPC file in that file's directory.
+VC backends run `process-file' in `default-directory', so set it to the
+directory of the file argument.  ORIG-FUN is `vc-call-backend', called with
+BACKEND, FUNCTION-NAME and ARGS."
+  (let ((file (car args)))
+    (if (and (memq function-name tramp-rpc--vc-file-operations)
+             (stringp file)
+             (tramp-rpc--managed-file-name-p file))
+        (let ((default-directory (file-name-directory file)))
+          (apply orig-fun backend function-name args))
+      (apply orig-fun backend function-name args))))
 
-(defun tramp-rpc--vc-exec-after-real (code okstatus proc)
-  "Call the real `vc-exec-after' with the arity this Emacs supports.
-CODE is the process exit code.
-OKSTATUS lists successful exit statuses.
-PROC is the process being handled."
-  (tramp-run-real-handler
-   #'vc-exec-after
-   (if (and proc (>= (cdr (func-arity #'vc-exec-after)) 3))
-       (list code okstatus proc)       ; Emacs 31+
-     (list code okstatus))))           ; Emacs 30
+(defun tramp-rpc--vc-exec-after-managed (code okstatus proc)
+  "Run CODE once TRAMP-RPC relay PROC is done, using its logical state.
+OKSTATUS is as for `vc-exec-after'."
+  (if (or (process-get proc :tramp-rpc-exited)
+          (not (memq (process-status proc) '(run open listen connect))))
+      (progn
+        ;; Match `vc-exec-after': drain pending output before the next VC
+        ;; stage.  Use zero-timeout accepts so we drain what is immediately
+        ;; available without blocking callers such as Dired/diff-hl that
+        ;; run with `inhibit-quit' bound; Emacs 30 warns about blocking
+        ;; `accept-process-output' in that context.
+        (while (accept-process-output proc 0 nil t))
+        (when (cond
+               ((null okstatus) t)
+               ((processp okstatus) (zerop (process-exit-status okstatus))) ; Emacs 30
+               ((integerp okstatus) (<= (process-exit-status proc) okstatus))) ; Emacs 31+
+          (if (functionp code) (funcall code) (eval code t))))
+    (vc-set-mode-line-busy-indicator)
+    (letrec ((fun (lambda (p _msg)
+                    (remove-function (process-sentinel p) fun)
+                    (when-let* ((buf (process-buffer p))
+                                ((buffer-live-p buf)))
+                      (with-current-buffer buf
+                        (tramp-rpc--vc-exec-after-managed code okstatus p))))))
+      (add-function :after (process-sentinel proc) fun)))
+  nil)
 
-(defun tramp-rpc-handle-vc-exec-after (code &optional okstatus proc)
-  "Handler for `vc-exec-after' to handle TRAMP-RPC relay processes.
+(defun tramp-rpc--vc-exec-after-advice (orig-fun code &rest args)
+  "Run CODE after a TRAMP-RPC relay using its logical process state.
 
 Some native-compiled VC functions can observe the raw local relay process
-state instead of the logical state provided by the `process-status' handler.  A
-short-lived remote command can leave the local cat relay in a non-`run' and
+state instead of the logical state provided by the `process-status' advice.
+A short-lived remote command can leave the local cat relay in a non-`run' and
 non-`exit' state while TRAMP-RPC has already recorded the remote exit.  The
 stock `vc-exec-after' then signals \"Unexpected process state\".  For
 TRAMP-RPC processes, reproduce `vc-exec-after' using the logical process
-state.
-CODE is the process exit code.
-OKSTATUS lists successful exit statuses.
-PROC is the process being handled."
-  (let ((proc (or proc (get-buffer-process (current-buffer)))))
-    (if (and (processp proc)
-             (process-get proc :tramp-rpc-pid))
-        (let ((status (cond
-                       ((process-get proc :tramp-rpc-exited) 'exit)
-                       ((memq (process-status proc) '(run open listen connect)) 'run)
-                       (t 'exit))))
-          (cond
-           ((eq status 'exit)
-            ;; Match `vc-exec-after': drain pending output before the next VC
-            ;; stage.  Use zero-timeout accepts so we drain what is immediately
-            ;; available without blocking callers such as Dired/diff-hl that
-            ;; run with `inhibit-quit' bound; Emacs 30 warns about blocking
-            ;; `accept-process-output' in that context.
-            (while (accept-process-output proc 0 nil t))
-            (when (cond
-                   ((null okstatus) t)
-                   ((processp okstatus) (zerop (process-exit-status okstatus))) ; Emacs 30
-                   ((integerp okstatus) (<= (process-exit-status proc) okstatus))) ; Emacs 31+
-              (if (functionp code) (funcall code) (eval code t))))
-           ((eq status 'run)
-            (vc-set-mode-line-busy-indicator)
-            (letrec ((fun (lambda (p _msg)
-                            (remove-function (process-sentinel p) fun)
-                            (when-let* ((buf (process-buffer p))
-                                        (_ (buffer-live-p buf)))
-                              (with-current-buffer buf
-                                (tramp-rpc-handle-vc-exec-after code okstatus p))))))
-              (add-function :after (process-sentinel proc) fun)))
-           (t
-            (tramp-rpc--vc-exec-after-real code okstatus proc))))
-      (tramp-rpc--vc-exec-after-real code okstatus proc)))
-  nil)
+state.  ORIG-FUN is `vc-exec-after'; ARGS are its OKSTATUS and PROC."
+  (let ((proc (or (nth 1 args) (get-buffer-process (current-buffer)))))
+    (if (and (processp proc) (process-get proc :tramp-rpc-pid))
+        (tramp-rpc--vc-exec-after-managed code (car args) proc)
+      (apply orig-fun code args))))
 
 ;; ============================================================================
 ;; Python shell integration
@@ -438,14 +448,13 @@ BODYFUN performs the wrapped operation."
 ;;
 ;; This handler bypasses the shell wrapper for tramp-rpc connections.
 
-(defun tramp-rpc-handle-eglot--cmd (contact)
-  "Handler for `eglot--cmd' to avoid shell wrapping for tramp-rpc.
-For tramp-rpc connections, return CONTACT directly without wrapping
-in a shell command.  This is safe because tramp-rpc uses pipes (not PTYs)
-and handles binary data correctly."
+(defun tramp-rpc--eglot--cmd-advice (orig-fun contact &rest args)
+  "Return CONTACT unwrapped for TRAMP-RPC, otherwise call ORIG-FUN.
+TRAMP-RPC uses pipes, not PTYs, and handles binary data correctly, so the
+shell wrapper is not needed.  ARGS are passed to ORIG-FUN."
   (if (tramp-rpc-file-name-p default-directory)
       contact
-    (tramp-run-real-handler 'eglot--cmd (list contact))))
+    (apply orig-fun contact args)))
 
 ;; ============================================================================
 ;; Magit: force pipe mode for stdin piping
@@ -468,19 +477,18 @@ and handles binary data correctly."
 ;; is not flagged as an unused lexical variable by the byte-compiler.
 (defvar magit-tramp-pipe-stty-settings)
 
-(defun tramp-rpc-handle-magit-start-process (program &optional input &rest args)
-  "Force pipe mode for tramp-rpc when INPUT will be piped to the process.
+(defun tramp-rpc--magit-start-process-advice (orig-fun program
+                                                      &optional input
+                                                      &rest args)
+  "Force pipe mode for TRAMP-RPC when INPUT will be piped to the process.
 PTY mode breaks stdin piping because `process-send-eof' sends Ctrl-D
 which does not close the pipe — git waits for more input forever.
-PROGRAM is the executable name."
-  (if input
-      ;; Let-bind magit-tramp-pipe-stty-settings to "" so that
-      ;; magit-start-process sets process-connection-type to nil (pipe).
+ORIG-FUN is `magit-start-process', called with PROGRAM, INPUT and ARGS."
+  (if (and input (tramp-rpc--managed-file-name-p default-directory))
+      ;; magit-start-process uses a pipe when this is "".
       (let ((magit-tramp-pipe-stty-settings ""))
-	(tramp-run-real-handler
-	 'magit-start-process (append `(,program ,input) args)))
-    (tramp-run-real-handler
-     'magit-start-process (append `(,program ,input) args))))
+        (apply orig-fun program input args))
+    (apply orig-fun program input args)))
 
 ;; ============================================================================
 ;; vc-dir stale-process guard
@@ -489,82 +497,69 @@ PROGRAM is the executable name."
 ;; `vc-dir-busy' tests (get-buffer-process vc-dir-process-buffer).
 ;; In Emacs, `get-buffer-process' returns ANY process associated with the
 ;; buffer -- including exited ones -- as long as `delete-process' has not
-;; been called.  Normally our deferred `tramp-rpc--install-process-cleanup'
-;; handles this, but if the timer hasn't fired yet (or if the cat relay got
-;; stuck), the stale process causes "Another update process is in progress".
+;; been called.  Normally `tramp-rpc--pipe-relay-sentinel' deletes the exited
+;; relay, but if its timer hasn't fired yet (or if the cat relay got stuck),
+;; the stale process causes "Another update process is in progress".
 ;; This handler acts as a safety net: before `vc-dir-refresh' checks the
 ;; busy flag, we delete any exited tramp-rpc relay process from the buffer.
 
-(defun tramp-rpc--vc-dir-refresh-file-name-for-operation
-    (_operation)
-  "Helper function for `vc-dir-refresh' handler."
-  (if (and (bound-and-true-p vc-dir-process-buffer)
-           (buffer-live-p vc-dir-process-buffer))
-      (tramp-get-default-directory vc-dir-process-buffer)
-      ""))
-
-(defun tramp-rpc-handle-vc-dir-refresh ()
-  "Handler for `vc-dir-refresh' to clean up stale TRAMP-RPC relay processes.
-If the `vc-dir' process buffer has a tramp-rpc cat relay that has already
-exited (remote side finished), delete it so the refresh can proceed."
-  (let ((proc (get-buffer-process vc-dir-process-buffer)))
-    (when (and proc
-               (process-get proc :tramp-rpc-pid)
-               (or (process-get proc :tramp-rpc-exited)
-                   (not (process-live-p proc))))
-      (remhash proc tramp-rpc--async-processes)
-      (delete-process proc)))
-  (tramp-run-real-handler 'vc-dir-refresh nil))
+(defun tramp-rpc--vc-dir-refresh-advice (orig-fun &rest args)
+  "Delete an exited TRAMP-RPC relay of the `vc-dir' buffer, then ORIG-FUN.
+The relay would otherwise make the refresh report a busy update process.
+ARGS are passed to ORIG-FUN."
+  (when-let* (((bound-and-true-p vc-dir-process-buffer))
+              ((buffer-live-p vc-dir-process-buffer))
+              (proc (get-buffer-process vc-dir-process-buffer))
+              ((process-get proc :tramp-rpc-pid))
+              ((or (process-get proc :tramp-rpc-exited)
+                   (not (process-live-p proc)))))
+    (tramp-rpc--forget-managed-process proc)
+    (delete-process proc))
+  (apply orig-fun args))
 
 ;; ============================================================================
 ;; Install and uninstall handler
 ;; ============================================================================
 
+(defconst tramp-rpc--advice
+  '(;; Process primitives, routed by process ownership.
+    (process-send-string . tramp-rpc--process-send-string-advice)
+    (process-send-region . tramp-rpc--process-send-region-advice)
+    (process-send-eof . tramp-rpc--process-send-eof-advice)
+    (process-status . tramp-rpc--process-status-advice)
+    (process-exit-status . tramp-rpc--process-exit-status-advice)
+    (process-command . tramp-rpc--process-command-advice)
+    (process-tty-name . tramp-rpc--process-tty-name-advice)
+    (set-process-sentinel . tramp-rpc--set-process-sentinel-advice)
+    (process-sentinel . tramp-rpc--process-sentinel-advice)
+    (set-process-coding-system . tramp-rpc--set-process-coding-system-advice)
+    (process-coding-system . tramp-rpc--process-coding-system-advice)
+    (vterm--window-adjust-process-window-size
+     . tramp-rpc--vterm-window-adjust-advice)
+    (eat--adjust-process-window-size . tramp-rpc--eat-window-adjust-advice)
+    ;; Integrations, which wrap the original call for TRAMP-RPC files.
+    (vc-call-backend . tramp-rpc--vc-call-backend-advice)
+    (vc-exec-after . tramp-rpc--vc-exec-after-advice)
+    (vc-dir-refresh . tramp-rpc--vc-dir-refresh-advice)
+    (eglot--cmd . tramp-rpc--eglot--cmd-advice)
+    (magit-start-process . tramp-rpc--magit-start-process-advice))
+  "Functions tramp-rpc advises, with their advice.
+Advice, unlike a Tramp external operation, calls the original function
+directly: Tramp runs it under `tramp-run-real-handler', which disables the
+handler for nested calls of the same operation, including callbacks run while
+it waits.  Advising a function that is not loaded yet takes effect when it
+is defined.")
+
 (defun tramp-rpc-handler-install ()
   "Install all process handler for tramp-rpc."
-  (unless (advice-member-p #'tramp-rpc--set-process-coding-system-advice
-                           'set-process-coding-system)
-    (advice-add 'set-process-coding-system :around
-                #'tramp-rpc--set-process-coding-system-advice))
-  (unless (advice-member-p #'tramp-rpc--process-coding-system-advice
-                           'process-coding-system)
-    (advice-add 'process-coding-system :around
-                #'tramp-rpc--process-coding-system-advice))
-  (tramp-rpc--add-external-operation
-     'process-send-string
-     #'tramp-rpc-handle-process-send-string 'tramp-rpc 'process)
-    (tramp-rpc--add-external-operation
-     'process-send-region
-     #'tramp-rpc-handle-process-send-region 'tramp-rpc 'process)
-  (tramp-rpc--add-external-operation
-     'process-send-eof
-     #'tramp-rpc-handle-process-send-eof 'tramp-rpc 'process)
+  (pcase-dolist (`(,function . ,advice) tramp-rpc--advice)
+    ;; Outermost, so ownership is checked before any Tramp dispatch.
+    (advice-add function :around advice '((depth . -10))))
   ;; This must be before `tramp-signal-process'.  Since tramp.el is
   ;; required, this is guaranteed.
   (add-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
-  (tramp-rpc--add-external-operation
-     'process-status
-     #'tramp-rpc-handle-process-status 'tramp-rpc 'process)
-    (tramp-rpc--add-external-operation
-     'process-exit-status
-     #'tramp-rpc-handle-process-exit-status 'tramp-rpc 'process)
-    (tramp-rpc--add-external-operation
-     'process-command
-     #'tramp-rpc-handle-process-command 'tramp-rpc 'process)
-  (tramp-rpc--add-external-operation
-     'process-tty-name
-     #'tramp-rpc-handle-process-tty-name 'tramp-rpc 'process)
-  (tramp-rpc--add-external-operation
-     'vc-call-backend
-     #'tramp-rpc-handle-vc-call-backend 'tramp-rpc
-     #'tramp-rpc--vc-call-backend-file-name-for-operation)
-  (tramp-rpc--add-external-operation
-     'vc-exec-after
-     #'tramp-rpc-handle-vc-exec-after 'tramp-rpc 'default-directory)
-  (tramp-rpc--add-external-operation
-   'vc-dir-refresh
-   #'tramp-rpc-handle-vc-dir-refresh 'tramp-rpc
-   #'tramp-rpc--vc-dir-refresh-file-name-for-operation))
+  ;; Likewise before `tramp-interrupt-process'.
+  (add-hook 'interrupt-process-functions #'tramp-rpc-handle-interrupt-process))
 
 (defun tramp-rpc-advice-install-optional-handlers ()
   "Install handlers for loaded optional integration packages."
@@ -586,41 +581,20 @@ exited (remote side finished), delete it so the refresh can proceed."
           (advice-add
            'python-shell--tramp-with-environment
            :around
-           #'tramp-rpc-handle-python-shell--tramp-with-environment-compat))))
-  (when (featurep 'eglot)
-    (tramp-rpc--add-external-operation
-       'eglot--cmd
-       #'tramp-rpc-handle-eglot--cmd 'tramp-rpc 'default-directory))
-  (when (featurep 'magit-process)
-    (tramp-rpc--add-external-operation
-       'magit-start-process
-       #'tramp-rpc-handle-magit-start-process 'tramp-rpc 'default-directory)))
+           #'tramp-rpc-handle-python-shell--tramp-with-environment-compat)))))
 
 (defun tramp-rpc-handler-remove ()
   "Remove all process handler installed by tramp-rpc."
-  (advice-remove 'set-process-coding-system
-                 #'tramp-rpc--set-process-coding-system-advice)
-  (advice-remove 'process-coding-system
-                 #'tramp-rpc--process-coding-system-advice)
-  (tramp-rpc--remove-external-operation 'process-send-string 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'process-send-region 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'process-send-eof 'tramp-rpc)
+  (pcase-dolist (`(,function . ,advice) tramp-rpc--advice)
+    (advice-remove function advice))
   (remove-hook 'signal-process-functions #'tramp-rpc-handle-signal-process)
-  (tramp-rpc--remove-external-operation 'process-status 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'process-exit-status 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'process-command 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'process-tty-name 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'vc-call-backend 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'vc-exec-after 'tramp-rpc)
+  (remove-hook 'interrupt-process-functions #'tramp-rpc-handle-interrupt-process)
   (tramp-rpc--remove-external-operation
    'python-shell--tramp-with-environment 'tramp-rpc)
   (when (fboundp 'python-shell--tramp-with-environment)
     (advice-remove
      'python-shell--tramp-with-environment
-     #'tramp-rpc-handle-python-shell--tramp-with-environment-compat))
-  (tramp-rpc--remove-external-operation 'eglot--cmd 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'magit-start-process 'tramp-rpc)
-  (tramp-rpc--remove-external-operation 'vc-dir-refresh 'tramp-rpc))
+     #'tramp-rpc-handle-python-shell--tramp-with-environment-compat)))
 
 
 ;; ============================================================================
